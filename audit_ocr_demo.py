@@ -22,6 +22,10 @@ import base64
 
 from openai import OpenAI
 client = OpenAI()
+# نقرأ الـ API key من Streamlit secrets ونجهّز الكلاينت
+import os
+os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
+client = OpenAI()
 
 # =========================================================
 # 0) CONFIG
@@ -239,203 +243,8 @@ def preprocess_for_ocr(pil_img: Image.Image) -> np.ndarray:
     return th
 
 
-def run_ocr(pil_img: Image.Image) -> str:
-    ensure_tesseract()
-    proc = preprocess_for_ocr(pil_img)
-
-    # نحدّد نوع النص (بلوك) ونقيّد الحروف شوي
-    config = (
-        "--oem 3 --psm 6 "
-        "-c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz./:-%"
-    )
-
-    text = pytesseract.image_to_string(proc, config=config, lang="eng")
-    return text or ""
 
 
-def extract_fields(raw_text: str) -> dict:
-    """
-    استخراج Model / Serial / Voltage / Current / Power / Frequency
-    مع مراعاة معظم الطرق الشائعة لكتابتها عالميًا (إنجليزي + لغات أخرى + عربي).
-    """
-    import re
-
-    raw_text = raw_text or ""
-    lines = [ln.strip() for ln in raw_text.splitlines() if ln.strip()]
-    text = " ".join(lines)
-
-    # ==== كلمات مفتاحية لتمييز الحقول (labels) ====
-
-    # Serial number: Serial No, S/N, Serien-Nr, N° de série, رقم تسلسلي, ...
-    SERIAL_KEYWORDS = [
-        "serial", "serial no", "serial number", "ser no", "ser. no","S/N","S.NO"
-        "s/n", "s-n", "sn",
-        "serien-nr",             # ألماني
-        "n° de série", "no de serie",  # فرنسي / إسباني
-        "nr seryjny",            # بولندي
-        "رقم تسلسلي", "الرقم التسلسلي",
-    ]
-
-    # Model / type / part: Model, Model Code, Type No, Cat No, Part No, P/N, Article No, Ref, ...
-    MODEL_KEYWORDS = [
-        "model code", "model no", "model number", "model",
-        "type no", "type",
-        "cat no", "catalog no", "cat. no",
-        "part no", "p/n",
-        "art no", "article no",
-        "ref", "reference",
-        "modèle",      # فرنسي
-        "tipo",        # إيطالي / إسباني
-        "رقم الموديل", "موديل",
-    ]
-
-    # Voltage: Voltage, Un, Ue, Volt, V~, VAC, VDC, الجهد, ...
-    VOLTAGE_KEYWORDS = [
-        "voltage", "rated voltage", "un", "ue", "u=", "u~",
-        "volt",
-        "tension", "spannung", "tensión", "tensione",
-        "الجهد", "فولت",
-    ]
-
-    # Current: Current, FLA, FLC, RLA, amp, amps, ampere, التيار, ...
-    CURRENT_KEYWORDS = [
-        "current", "rated current", "flc", "fla", "rla",
-        "amp", "amps", "ampere", "amperes",
-        "intensidad", "corrente",
-        "التيار", "شدة التيار",
-    ]
-
-    # Power: Power, kW, W, VA, kVA, HP, ...
-    POWER_KEYWORDS = [
-        "power", "rated power", "input power", "output power",
-        "kw", "w", "va", "kva", "hp",
-    ]
-
-    # Frequency: Frequency, Hz, F=, التردد, ...
-    FREQ_KEYWORDS = [
-        "frequency", "freq", "hz", "f=",
-        "التردد",
-    ]
-
-    # ===== Helpers =====
-
-    def format_num(val):
-        """تخلي الرقم بشكل لطيف (يكون string، بدون أصفار زيادة)."""
-        try:
-            v = float(str(val).replace(",", "."))
-        except Exception:
-            return None
-        if abs(v - round(v)) < 1e-6:
-            return str(int(round(v)))
-        return str(round(v, 3))
-
-    def pick_code_from_line(ln: str):
-        """
-        يختار كود شبِه بالموديل/السيريال:
-        - أحرف + أرقام
-        - طول >= 4
-        """
-        tokens = re.findall(r"[A-Z0-9][A-Z0-9\-_\/\.]{3,}", ln, flags=re.IGNORECASE)
-        codes = [t for t in tokens if re.search(r"\d", t)]
-        return codes[0] if codes else None
-
-    # ===== Serial =====
-    serial = None
-    for ln in lines:
-        low = ln.lower()
-        if any(k in low for k in SERIAL_KEYWORDS):
-            cand = pick_code_from_line(ln)
-            if cand:
-                serial = cand
-                break
-
-    # ===== Model =====
-    model = None
-    for ln in lines:
-        low = ln.lower()
-        if any(k in low for k in MODEL_KEYWORDS):
-            cand = pick_code_from_line(ln)
-            if cand:
-                model = cand
-                break
-
-    # ===== Voltage (V) =====
-    voltage = None
-
-    # 1) أنماط مباشرة فيها وحدة V / VAC / VDC / kV
-    m = re.search(r"(\d+(?:\.\d+)?)\s*(?:v|vac|vdc|kv)\b", text, flags=re.IGNORECASE)
-    if m:
-        voltage = format_num(m.group(1))
-
-    # 2) لو ما لقينا، نحاول أسطر فيها كلمات جهد (Un, Voltage, الجهد...)
-    if voltage is None:
-        for ln in lines:
-            low = ln.lower()
-            if any(k in low for k in VOLTAGE_KEYWORDS):
-                m2 = re.search(r"(\d+(?:\.\d+)?)", ln)
-                if m2:
-                    voltage = format_num(m2.group(1))
-                    break
-
-    # ===== Current (A) =====
-    current = None
-
-    # 1) رقم مع A/Amp/Amps/mA
-    m = re.search(r"(\d+(?:\.\d+)?)\s*(?:a|amp|amps|ma)\b", text, flags=re.IGNORECASE)
-    if m:
-        current = format_num(m.group(1))
-
-    # 2) لو ما لقينا، ندور في أسطر اللي فيها كلمات Current/FLA/التيار...
-    if current is None:
-        for ln in lines:
-            low = ln.lower()
-            if any(k in low for k in CURRENT_KEYWORDS):
-                m2 = re.search(r"(\d+(?:\.\d+)?)", ln)
-                if m2:
-                    current = format_num(m2.group(1))
-                    break
-
-    # ===== Frequency (Hz) =====
-    freq = None
-
-    m = re.search(r"(\d+(?:\.\d+)?)\s*hz\b", text, flags=re.IGNORECASE)
-    if m:
-        freq = format_num(m.group(1))
-
-    if freq is None:
-        for ln in lines:
-            low = ln.lower()
-            if any(k in low for k in FREQ_KEYWORDS):
-                m2 = re.search(r"(\d+(?:\.\d+)?)", ln)
-                if m2:
-                    freq = format_num(m2.group(1))
-                    break
-
-    # ===== Power (kW / W) =====
-    power_kw = None
-
-    # kW مباشرة
-    m = re.search(r"(\d+(?:\.\d+)?)\s*kw\b", text, flags=re.IGNORECASE)
-    if m:
-        power_kw = format_num(m.group(1))
-    else:
-        # نحاول W ونحوّل لـ kW
-        m2 = re.search(r"(\d+(?:\.\d+)?)\s*w\b", text, flags=re.IGNORECASE)
-        if m2:
-            try:
-                wv = float(m2.group(1).replace(",", "."))
-                power_kw = format_num(wv / 1000.0)
-            except Exception:
-                power_kw = m2.group(1)
-
-    return {
-        "Model": model,
-        "Serial": serial,
-        "Voltage_V": voltage,
-        "Current_A": current,
-        "Power_kW": power_kw,
-        "Frequency_Hz": freq,
-    }
 
 def call_ai_vision(pil_img: Image.Image) -> dict:
     """
@@ -519,6 +328,125 @@ def call_ai_vision(pil_img: Image.Image) -> dict:
         # لو صار خطأ (ما في API key, مشكلة نت, ...الخ) نرجّع قاموس فاضي
         print("AI vision error:", e)
         return {}
+
+# =========================================================
+# 2) OCR + AI VISION PIPELINE
+# =========================================================
+
+def classic_ocr_text(pil_img: Image.Image) -> str:
+    """محاولة سريعة مع Tesseract (لو مش موجود، نرجع نص فاضي بدون ما نكسر التطبيق)."""
+    try:
+        ensure_tesseract()
+        proc = preprocess_for_ocr(pil_img)
+        text = pytesseract.image_to_string(
+            proc,
+            config="--oem 3 --psm 6",
+            lang="eng"
+        )
+        return text or ""
+    except pytesseract.pytesseract.TesseractNotFoundError:
+        # على Streamlit Cloud رح نوصل لهون – عادي
+        return ""
+    except Exception:
+        return ""
+
+
+def ai_extract_fields(pil_img: Image.Image) -> tuple[str, dict]:
+    """
+    نستخدم نموذج OpenAI Vision عشان يقرأ النيمبليت
+    ويرجع JSON فيه القيم اللي بدنا ياها.
+    """
+    try:
+        # نحول الصورة لـ base64
+        buf = io.BytesIO()
+        pil_img.save(buf, format="JPEG")
+        b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+        prompt = """
+أنت خبير تدقيق كهربائي. عندك صورة Nameplate واحدة لجهاز.
+اقرأ كل المعلومات المهمة واستخرج القيم التالية فقط:
+
+- model  : كود الموديل / type
+- serial : الرقم التسلسلي كما هو مكتوب
+- voltage_v : جهد التغذية بالفولت (رقم واحد، لو مكتوب 220-240V خذ 230 مثلاً)
+- current_a : التيار بالأمبير
+- power_kw  : الاستطاعة بالكيلوواط (لو مكتوب W حوّلها إلى kW بثلاث منازل عشرية)
+- frequency_hz : التردد بالهرتز (50 أو 60 غالبًا)
+
+ارجع **JSON فقط** بدون أي شرح إضافي، مثلاً:
+
+{
+  "model": "TCM80C6PIZ(EX)",
+  "serial": "509501000",
+  "voltage_v": 230,
+  "current_a": 2.0,
+  "power_kw": 0.4,
+  "frequency_hz": 50
+}
+
+لو حقل غير موجود على النيمبليت، رجّعه بالقيمة null.
+"""
+
+        response = client.responses.create(
+            model="gpt-4.1-mini",
+            input=[{
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": prompt},
+                    {
+                        "type": "input_image",
+                        "image_url": f"data:image/jpeg;base64,{b64}",
+                    },
+                ],
+            }],
+            response_format={"type": "json_object"},
+            max_output_tokens=300,
+        )
+
+        json_text = response.output_text
+        data = json.loads(json_text)
+
+        fields = {
+            "Model": data.get("model"),
+            "Serial": data.get("serial"),
+            "Voltage_V": str(data.get("voltage_v") or "") or "",
+            "Current_A": str(data.get("current_a") or "") or "",
+            "Power_kW": str(data.get("power_kw") or "") or "",
+            "Frequency_Hz": str(data.get("frequency_hz") or "") or "",
+        }
+        return json_text, fields
+
+    except Exception as e:
+        print("AI vision error:", e)
+        empty = {
+            "Model": "",
+            "Serial": "",
+            "Voltage_V": "",
+            "Current_A": "",
+            "Power_kW": "",
+            "Frequency_Hz": "",
+        }
+        return "", empty
+
+
+def analyze_nameplate(pil_img: Image.Image) -> tuple[str, dict]:
+    """
+    دالة موحّدة: تحاول Tesseract (لو موجود) + AI Vision
+    وترجع:
+      raw_text  -> نخزنه في RawOCR
+      fields    -> نعبّي فيه الحقول على الشاشة + بالملف
+    """
+    classic = classic_ocr_text(pil_img)  # ممكن يكون فاضي على الكلاود
+    ai_json, ai_fields = ai_extract_fields(pil_img)
+
+    # فقط عشان الديبَغ: نخزن كل الإشيين في RawOCR
+    raw_combined = ""
+    if classic:
+        raw_combined += classic + "\n\n---\n\n"
+    if ai_json:
+        raw_combined += ai_json
+
+    return raw_combined, ai_fields
 
 # =========================================================
 # 3) EXCEL REPORT (Embedded Images)
@@ -685,115 +613,86 @@ if facility_name and place:
             uploaded = st.file_uploader(
                 f"Upload Nameplate image for {place} #{i}",
                 type=["png", "jpg", "jpeg"],
-                key=f"upl_{audit_type}_{place}_{i}"
+                key=f"upl_{audit_type}_{place}_{i}",
             )
 
             if uploaded:
                 # 1) عرض الصورة
                 pil_img = Image.open(uploaded)
-                st.image(pil_img, caption="Uploaded image", use_container_width=True)
-
-                raw = ""
-                fields_ocr = {}
-                fields_ai = {}
-
-                # 2) OCR الكلاسيكي (Tesseract + Regex)
-                try:
-                    with st.spinner("Running classic OCR (Tesseract)..."):
-                        raw = run_ocr(pil_img)
-                    fields_ocr = extract_fields(raw)
-                except pytesseract.pytesseract.TesseractNotFoundError:
-                    st.warning(
-                        "Tesseract not found. Classic OCR is disabled. "
-                        "Install it or set TESSERACT_CMD if you want it."
-                    )
-                    fields_ocr = {}
-
-                # 3) AI Vision (OpenAI) – اختياري إذا في OPENAI_API_KEY
-                if os.environ.get("OPENAI_API_KEY"):
-                    with st.spinner("Running AI vision (OpenAI)..."):
-                        fields_ai = call_ai_vision(pil_img)
-                else:
-                    st.info(
-                        "AI vision is disabled (no OPENAI_API_KEY set). "
-                        "Only classic OCR is used."
-                    )
-                    fields_ai = {}
-
-                # 4) دمج نتائج AI + OCR
-                fields = {}
-                fields["Model"] = fields_ai.get("Model") or fields_ocr.get("Model")
-                fields["Serial"] = fields_ai.get("Serial") or fields_ocr.get("Serial")
-                fields["Voltage_V"] = (
-                    fields_ai.get("Voltage_V") or fields_ocr.get("Voltage_V")
-                )
-                fields["Current_A"] = (
-                    fields_ai.get("Current_A") or fields_ocr.get("Current_A")
-                )
-                fields["Power_kW"] = (
-                    fields_ai.get("Power_kW") or fields_ocr.get("Power_kW")
-                )
-                fields["Frequency_Hz"] = (
-                    fields_ai.get("Frequency_Hz") or fields_ocr.get("Frequency_Hz")
+                st.image(
+                    pil_img,
+                    caption="Uploaded image",
+                    use_container_width=True,
                 )
 
-                # 5) الحقول القابلة للتعديل من المستخدم
+                # 2) تحليل الصورة (AI Vision + OCR الكلاسيكي)
+                with st.spinner("تحليل الصورة واستخراج القيم..."):
+                    raw, fields = analyze_nameplate(pil_img)
+
+                # 3) الحقول القابلة للتعديل من المستخدم
                 st.markdown("### Extracted fields (edit if needed)")
                 c1, c2, c3, c4, c5, c6 = st.columns(6)
                 with c1:
                     model = st.text_input(
                         "Model",
                         value=fields.get("Model") or "",
-                        key=f"model_{place}_{i}"
+                        key=f"model_{place}_{i}",
                     )
                 with c2:
                     serial = st.text_input(
                         "Serial",
                         value=fields.get("Serial") or "",
-                        key=f"serial_{place}_{i}"
+                        key=f"serial_{place}_{i}",
                     )
                 with c3:
                     voltage = st.text_input(
                         "Voltage (V)",
                         value=fields.get("Voltage_V") or "",
-                        key=f"volt_{place}_{i}"
+                        key=f"volt_{place}_{i}",
                     )
                 with c4:
                     current = st.text_input(
                         "Current (A)",
                         value=fields.get("Current_A") or "",
-                        key=f"curr_{place}_{i}"
+                        key=f"curr_{place}_{i}",
                     )
                 with c5:
                     power = st.text_input(
                         "Power (kW)",
                         value=fields.get("Power_kW") or "",
-                        key=f"pwr_{place}_{i}"
+                        key=f"pwr_{place}_{i}",
                     )
                 with c6:
                     freq = st.text_input(
                         "Frequency (Hz)",
                         value=fields.get("Frequency_Hz") or "",
-                        key=f"hz_{place}_{i}"
+                        key=f"hz_{place}_{i}",
                     )
 
                 notes = st.text_input(
                     "Notes (optional)",
                     value="",
-                    key=f"notes_{place}_{i}"
+                    key=f"notes_{place}_{i}",
                 )
 
-                # 6) نص الـ OCR الخام للفلترة اليدوية لو حبيتي
-                with st.expander("Raw OCR Text"):
+                # 4) نص الـ OCR / AI JSON الخام
+                with st.expander("Raw OCR / AI JSON"):
                     st.code(raw[:3000] if raw else "")
 
-                # 7) زر الحفظ
-                if st.button(f"Save record for {place} #{i}", key=f"save_{place}_{i}"):
+                # 5) زر الحفظ
+                if st.button(
+                    f"Save record for {place} #{i}",
+                    key=f"save_{place}_{i}",
+                ):
                     safe_fac = safe_name(facility_name)
                     safe_place = safe_name(place)
 
                     # مسار حفظ الصورة و JSON
-                    dir_path = os.path.join(OUTPUT_DIR, safe_fac, f"{safe_place}_{i}")
+                    dir_path = os.path.join(
+                        OUTPUT_DIR,
+                        safe_fac,
+                        f"{safe_place}_{i}",
+                    )
                     os.makedirs(dir_path, exist_ok=True)
 
                     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -817,12 +716,13 @@ if facility_name and place:
                         "ImagePath": img_path,
                         "RawOCR": raw,
                     }
+                    append_record(row)
 
-# =========================================================
-# 4.5) CURRENT PLACE TABLE PREVIEW
-# =========================================================
+                    json_path = os.path.join(dir_path, f"record_{ts}.json")
+                    with open(json_path, "w", encoding="utf-8") as f:
+                        json.dump(row, f, ensure_ascii=False, indent=2)
 
-st.divider()
+                    st.success("Saved! Record added to CSV with local image.")
 st.subheader("Current Place Table")
 
 if facility_name and place:
