@@ -123,6 +123,17 @@ def ensure_tesseract():
     if os.name == "nt" and os.path.exists(DEFAULT_TESS_CMD):
         pytesseract.pytesseract.tesseract_cmd = DEFAULT_TESS_CMD
 
+def append_record(row: dict):
+    """
+    تضيف صف جديد إلى ملف CSV (أو تنشئه إذا مش موجود).
+    """
+    if os.path.exists(CSV_PATH):
+        df = pd.read_csv(CSV_PATH)
+        df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+    else:
+        df = pd.DataFrame([row])
+
+    df.to_csv(CSV_PATH, index=False)
 
 def get_facility_dir(facility: str) -> str:
     safe_fac = safe_name(facility)
@@ -777,5 +788,6 @@ if facility_name:
         st.info("No records for this facility yet. Save at least one nameplate record.")
 else:
     st.info("Enter a Facility Name first.")
+
 
 
