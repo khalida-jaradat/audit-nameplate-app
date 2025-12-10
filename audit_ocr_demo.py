@@ -52,6 +52,12 @@ AUDIT_TEMPLATES = {
         "Generator Room",
         "Office Area",
         "Outdoor / Yard",
+        "Chiller Plant",
+        "Chilled Water Network",
+        "Compressed Air Network",
+        "Hot Water Network",
+        "Steam Network",
+        "Steam Generator",
     ],
     "Schools": [
         "Classrooms",
@@ -771,3 +777,4 @@ if facility_name:
         st.info("No records for this facility yet. Save at least one nameplate record.")
 else:
     st.info("Enter a Facility Name first.")
+
