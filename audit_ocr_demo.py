@@ -43,13 +43,13 @@ AUDIT_TEMPLATES = {
         "Laundry",
     ],
     "Factories": [
-        "Production Line",
+        "Production Lines",
         "Workshop / Maintenance",
         "Warehouse",
-        "Compressor Room",
-        "Boiler Room",
-        "Electrical Room",
-        "Generator Room",
+        "Compressor System",
+        "Boiler System",
+        "Electrical System",
+        "Generator System",
         "Office Area",
         "Outdoor / Yard",
         "Chiller Plant",
@@ -777,4 +777,5 @@ if facility_name:
         st.info("No records for this facility yet. Save at least one nameplate record.")
 else:
     st.info("Enter a Facility Name first.")
+
 
