@@ -20,9 +20,15 @@ from openpyxl.styles import Font, Alignment, PatternFill
 
 from openai import OpenAI
 
+# =========================================================
+# 0) OpenAI CLIENT (من الـ secrets)
+# =========================================================
+
+# توقّعنا إنك مبرمجة OPENAI_API_KEY في Streamlit secrets
+client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
 # =========================================================
-# 0) CONFIG
+# 1) CONFIG
 # =========================================================
 
 AUDIT_TEMPLATES = {
@@ -86,12 +92,12 @@ THUMBS_DIR = os.path.join(OUTPUT_DIR, "_thumbs")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(THUMBS_DIR, exist_ok=True)
 
-# common default on Windows (يفيدك لو شغّلتي محليًا)
+# useful لو شغّلتيه محليًا على ويندوز
 DEFAULT_TESS_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
 
 # =========================================================
-# 1) HELPERS
+# 2) HELPERS
 # =========================================================
 
 def safe_name(s: str) -> str:
@@ -142,7 +148,7 @@ def create_thumbnail(img_path: str) -> str | None:
 
 
 # =========================================================
-# 2) OCR + AI VISION
+# 3) OCR + AI VISION
 # =========================================================
 
 def preprocess_for_ocr(pil_img: Image.Image) -> np.ndarray:
@@ -184,23 +190,6 @@ def classic_ocr_text(pil_img: Image.Image) -> str:
         return ""
 
 
-def get_openai_client() -> OpenAI | None:
-    """تهيئة كائن OpenAI من الـ secrets أو من متغيرات البيئة."""
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        # نحاول نقرأ من Streamlit secrets لو موجود
-        try:
-            api_key = st.secrets.get("OPENAI_API_KEY", None)  # type: ignore[attr-defined]
-        except Exception:
-            api_key = None
-
-    if not api_key:
-        return None
-
-    os.environ["OPENAI_API_KEY"] = api_key
-    return OpenAI()
-
-
 def ai_extract_fields(pil_img: Image.Image) -> tuple[str, dict]:
     """
     استخدام OpenAI Vision لاستخراج الحقول من صورة الـ Nameplate.
@@ -208,24 +197,21 @@ def ai_extract_fields(pil_img: Image.Image) -> tuple[str, dict]:
       - json_text: سترنغ JSON خام للعرض في RawOCR
       - fields: dict فيه Model / Serial / Voltage_V / Current_A / Power_kW / Frequency_Hz
     """
-    client = get_openai_client()
-    if client is None:
-        # ما في API key – نرجع قيم فاضية
-        empty = {
-            "Model": "",
-            "Serial": "",
-            "Voltage_V": "",
-            "Current_A": "",
-            "Power_kW": "",
-            "Frequency_Hz": "",
-        }
-        return "", empty
+    empty = {
+        "Model": "",
+        "Serial": "",
+        "Voltage_V": "",
+        "Current_A": "",
+        "Power_kW": "",
+        "Frequency_Hz": "",
+    }
 
     try:
         # تحويل الصورة لـ base64
         buf = io.BytesIO()
         pil_img.save(buf, format="JPEG")
         b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+        data_url = f"data:image/jpeg;base64,{b64}"
 
         prompt = """
 أنت خبير تدقيق كهربائي. عندك صورة Nameplate واحدة لجهاز.
@@ -259,10 +245,7 @@ def ai_extract_fields(pil_img: Image.Image) -> tuple[str, dict]:
                     "role": "user",
                     "content": [
                         {"type": "input_text", "text": prompt},
-                        {
-                            "type": "input_image",
-                            "image_url": f"data:image/jpeg;base64,{b64}",
-                        },
+                        {"type": "input_image", "image_url": data_url},
                     ],
                 }
             ],
@@ -270,8 +253,8 @@ def ai_extract_fields(pil_img: Image.Image) -> tuple[str, dict]:
             max_output_tokens=300,
         )
 
-        # نص JSON من أول output
-        json_text = response.output[0].content[0].text  # type: ignore[index]
+        # نص JSON الناتج
+        json_text = response.output_text
 
         data = json.loads(json_text)
 
@@ -286,15 +269,8 @@ def ai_extract_fields(pil_img: Image.Image) -> tuple[str, dict]:
         return json_text, fields
 
     except Exception as e:
-        print("AI vision error:", e)
-        empty = {
-            "Model": "",
-            "Serial": "",
-            "Voltage_V": "",
-            "Current_A": "",
-            "Power_kW": "",
-            "Frequency_Hz": "",
-        }
+        # نعرض الخطأ في واجهة Streamlit ونرجّع قيم فاضية
+        st.error(f"AI vision error: {e}")
         return "", empty
 
 
@@ -318,7 +294,7 @@ def analyze_nameplate(pil_img: Image.Image) -> tuple[str, dict]:
 
 
 # =========================================================
-# 3) EXCEL EXPORT (مع الصور)
+# 4) EXCEL EXPORT (مع الصور)
 # =========================================================
 
 def build_excel_report(df: pd.DataFrame, out_path: str):
@@ -350,15 +326,15 @@ def build_excel_report(df: pd.DataFrame, out_path: str):
 
     def set_col_widths(ws):
         widths = {
-            1: 10,  # ID
-            2: 18,  # Place
-            3: 10,  # index
-            4: 20,  # Model
-            5: 22,  # Serial
-            6: 12,  # V
-            7: 12,  # A
-            8: 12,  # kW
-            9: 14,  # Hz
+            1: 10,   # ID
+            2: 18,   # Place
+            3: 10,   # index
+            4: 20,   # Model
+            5: 22,   # Serial
+            6: 12,   # V
+            7: 12,   # A
+            8: 12,   # kW
+            9: 14,   # Hz
             10: 22,  # timestamp
             11: 22,  # notes
             12: 30,  # image
@@ -447,7 +423,7 @@ def build_excel_report(df: pd.DataFrame, out_path: str):
 
 
 # =========================================================
-# 4) STREAMLIT UI
+# 5) STREAMLIT UI
 # =========================================================
 
 st.set_page_config(page_title="Audit Nameplate OCR - Demo", layout="wide")
@@ -519,7 +495,7 @@ if facility_name and place:
                     use_container_width=True,
                 )
 
-                # 2) تحليل الصورة
+                # 2) تحليل الصورة (OCR + AI)
                 with st.spinner("تحليل الصورة واستخراج القيم..."):
                     raw, fields = analyze_nameplate(pil_img)
 
@@ -618,7 +594,7 @@ if facility_name and place:
                     st.success("Saved! Record added to CSV with local image.")
 
 # =========================================================
-# 5) CURRENT CSV PREVIEW
+# 6) CURRENT CSV PREVIEW
 # =========================================================
 
 st.divider()
@@ -632,7 +608,7 @@ else:
     st.write("No records yet.")
 
 # =========================================================
-# 6) EXPORT EXCEL
+# 7) EXPORT EXCEL
 # =========================================================
 
 st.divider()
