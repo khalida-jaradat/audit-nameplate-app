@@ -20,15 +20,11 @@ from openpyxl.styles import Font, Alignment, PatternFill
 
 from openai import OpenAI
 
-# =========================================================
-# 0) OpenAI CLIENT (من الـ secrets)
-# =========================================================
-
-# توقّعنا إنك مبرمجة OPENAI_API_KEY في Streamlit secrets
+# ===== OpenAI client من الـ secrets =====
 client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
 # =========================================================
-# 1) CONFIG
+# 0) CONFIG
 # =========================================================
 
 AUDIT_TEMPLATES = {
@@ -92,12 +88,12 @@ THUMBS_DIR = os.path.join(OUTPUT_DIR, "_thumbs")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(THUMBS_DIR, exist_ok=True)
 
-# useful لو شغّلتيه محليًا على ويندوز
+# لو شغّلتيه على ويندوز محلياً
 DEFAULT_TESS_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
 
 # =========================================================
-# 2) HELPERS
+# 1) HELPERS
 # =========================================================
 
 def safe_name(s: str) -> str:
@@ -112,7 +108,6 @@ def ensure_tesseract():
     if env_cmd and os.path.exists(env_cmd):
         pytesseract.pytesseract.tesseract_cmd = env_cmd
         return
-
     if os.name == "nt" and os.path.exists(DEFAULT_TESS_CMD):
         pytesseract.pytesseract.tesseract_cmd = DEFAULT_TESS_CMD
 
@@ -124,7 +119,6 @@ def append_record(row: dict):
         df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
     else:
         df = pd.DataFrame([row])
-
     df.to_csv(CSV_PATH, index=False)
 
 
@@ -133,7 +127,6 @@ def create_thumbnail(img_path: str) -> str | None:
     try:
         if not img_path or not os.path.exists(img_path):
             return None
-
         base = os.path.basename(img_path)
         name, _ = os.path.splitext(base)
         thumb_path = os.path.join(THUMBS_DIR, f"{name}_thumb.png")
@@ -148,7 +141,7 @@ def create_thumbnail(img_path: str) -> str | None:
 
 
 # =========================================================
-# 3) OCR + AI VISION
+# 2) OCR + AI VISION
 # =========================================================
 
 def preprocess_for_ocr(pil_img: Image.Image) -> np.ndarray:
@@ -185,6 +178,7 @@ def classic_ocr_text(pil_img: Image.Image) -> str:
         )
         return text or ""
     except pytesseract.pytesseract.TesseractNotFoundError:
+        # على Streamlit Cloud غالبًا رح يصير هيك
         return ""
     except Exception:
         return ""
@@ -194,27 +188,18 @@ def ai_extract_fields(pil_img: Image.Image) -> tuple[str, dict]:
     """
     استخدام OpenAI Vision لاستخراج الحقول من صورة الـ Nameplate.
     يرجّع:
-      - json_text: سترنغ JSON خام للعرض في RawOCR
+      - raw_text: النص الخام (JSON أو نص عادي) لعرضه في Raw OCR
       - fields: dict فيه Model / Serial / Voltage_V / Current_A / Power_kW / Frequency_Hz
     """
-    empty = {
-        "Model": "",
-        "Serial": "",
-        "Voltage_V": "",
-        "Current_A": "",
-        "Power_kW": "",
-        "Frequency_Hz": "",
-    }
-
     try:
-        # تحويل الصورة لـ base64
+        # تحويل الصورة إلى base64
         buf = io.BytesIO()
         pil_img.save(buf, format="JPEG")
         b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-        data_url = f"data:image/jpeg;base64,{b64}"
+        img_url = f"data:image/jpeg;base64,{b64}"
 
         prompt = """
-أنت خبير تدقيق كهربائي. عندك صورة Nameplate واحدة لجهاز.
+أنت خبير تدقيق كهربائي. أمامك صورة Nameplate واحدة لجهاز.
 اقرأ كل المعلومات المهمة واستخرج القيم التالية فقط:
 
 - model       : كود الموديل / type
@@ -224,7 +209,7 @@ def ai_extract_fields(pil_img: Image.Image) -> tuple[str, dict]:
 - power_kw    : الاستطاعة بالكيلوواط (لو مكتوب W حوّلها إلى kW بثلاث منازل عشرية)
 - frequency_hz: التردد بالهرتز (50 أو 60 غالبًا)
 
-أرجع JSON فقط بدون أي شرح إضافي، مثلاً:
+ارْجِع **JSON صالح فقط** بدون أي نص إضافي، مثل الشكل التالي:
 
 {
   "model": "TCM80C6PIZ(EX)",
@@ -235,66 +220,87 @@ def ai_extract_fields(pil_img: Image.Image) -> tuple[str, dict]:
   "frequency_hz": 50
 }
 
-لو حقل غير موجود على النيمبليت، رجّعه بالقيمة null.
+لو حقل غير موجود على النيمبليت، ارجعه بالقيمة null.
 """
 
         response = client.responses.create(
-            model="gpt-4.1-mini",
+            model="gpt-4o-mini",
             input=[
                 {
                     "role": "user",
                     "content": [
                         {"type": "input_text", "text": prompt},
-                        {"type": "input_image", "image_url": data_url},
+                        {"type": "input_image", "image_url": img_url},
                     ],
                 }
             ],
-            response_format={"type": "json_object"},
-            max_output_tokens=300,
+            max_output_tokens=400,
         )
 
-        # نص JSON الناتج
-        json_text = response.output_text
+        # النص الناتج من الذكاء الاصطناعي (مفروض يكون JSON)
+        raw_text = response.output_text
 
-        data = json.loads(json_text)
+        data = {}
+        try:
+            data = json.loads(raw_text)
+        except Exception:
+            # لو رجّع كلام زيادة، نحاول نلقط أقرب {...}
+            m = re.search(r"\{.*\}", raw_text, re.DOTALL)
+            if m:
+                try:
+                    data = json.loads(m.group(0))
+                except Exception:
+                    data = {}
+
+        if not isinstance(data, dict):
+            data = {}
 
         fields = {
-            "Model": data.get("model") or "",
-            "Serial": data.get("serial") or "",
-            "Voltage_V": str(data.get("voltage_v") or "") or "",
-            "Current_A": str(data.get("current_a") or "") or "",
-            "Power_kW": str(data.get("power_kw") or "") or "",
-            "Frequency_Hz": str(data.get("frequency_hz") or "") or "",
+            "Model": str(data.get("model") or ""),
+            "Serial": str(data.get("serial") or ""),
+            "Voltage_V": str(data.get("voltage_v") or ""),
+            "Current_A": str(data.get("current_a") or ""),
+            "Power_kW": str(data.get("power_kw") or ""),
+            "Frequency_Hz": str(data.get("frequency_hz") or ""),
         }
-        return json_text, fields
+        return raw_text, fields
 
     except Exception as e:
-        # نعرض الخطأ في واجهة Streamlit ونرجّع قيم فاضية
+        # نظهر الخطأ في Streamlit للتشخيص
         st.error(f"AI vision error: {e}")
+        empty = {
+            "Model": "",
+            "Serial": "",
+            "Voltage_V": "",
+            "Current_A": "",
+            "Power_kW": "",
+            "Frequency_Hz": "",
+        }
         return "", empty
 
 
 def analyze_nameplate(pil_img: Image.Image) -> tuple[str, dict]:
     """
     دالة موحّدة:
-      - تحاول Tesseract (لو موجود محليًا)
-      - تستعمل AI Vision
+      - تحاول OCR الكلاسيكي (لو موجود)
+      - تستخدم AI Vision
       - ترجع نص مشترك + الحقول المستخرجة
     """
     classic = classic_ocr_text(pil_img)
-    ai_json, ai_fields = ai_extract_fields(pil_img)
+    ai_raw, ai_fields = ai_extract_fields(pil_img)
 
     raw_combined = ""
     if classic:
         raw_combined += classic + "\n\n---\n\n"
-    if ai_json:
-        raw_combined += ai_json
+    if ai_raw:
+        raw_combined += ai_raw
 
+    # حاليًا نعتمد على AI بشكل أساسي
     return raw_combined, ai_fields
 
 
 # =========================================================
-# 4) EXCEL EXPORT (مع الصور)
+# 3) EXCEL EXPORT (مع الصور)
 # =========================================================
 
 def build_excel_report(df: pd.DataFrame, out_path: str):
@@ -423,7 +429,7 @@ def build_excel_report(df: pd.DataFrame, out_path: str):
 
 
 # =========================================================
-# 5) STREAMLIT UI
+# 4) STREAMLIT UI
 # =========================================================
 
 st.set_page_config(page_title="Audit Nameplate OCR - Demo", layout="wide")
@@ -474,6 +480,7 @@ if facility_name and place:
         f"**{facility_name} → {place} (1..{int(count)})**"
     )
 
+# التقط الصور واملا الحقول
 st.divider()
 st.subheader("Capture nameplates")
 
@@ -495,7 +502,7 @@ if facility_name and place:
                     use_container_width=True,
                 )
 
-                # 2) تحليل الصورة (OCR + AI)
+                # 2) تحليل الصورة (OCR الكلاسيكي + AI)
                 with st.spinner("تحليل الصورة واستخراج القيم..."):
                     raw, fields = analyze_nameplate(pil_img)
 
@@ -545,7 +552,7 @@ if facility_name and place:
                     key=f"notes_{place}_{i}",
                 )
 
-                # 4) نصّ الـ OCR / JSON
+                # 4) نصّ الـ OCR / JSON للفلترة اليدوية
                 with st.expander("Raw OCR / AI JSON"):
                     st.code(raw[:3000] if raw else "")
 
@@ -594,7 +601,7 @@ if facility_name and place:
                     st.success("Saved! Record added to CSV with local image.")
 
 # =========================================================
-# 6) CURRENT CSV PREVIEW
+# 5) CURRENT CSV PREVIEW
 # =========================================================
 
 st.divider()
@@ -608,7 +615,7 @@ else:
     st.write("No records yet.")
 
 # =========================================================
-# 7) EXPORT EXCEL
+# 6) EXPORT EXCEL
 # =========================================================
 
 st.divider()
