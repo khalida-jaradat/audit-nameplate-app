@@ -18,13 +18,43 @@ from openpyxl.drawing.image import Image as XLImage
 from openpyxl.utils import get_column_letter
 from openpyxl.styles import Font, Alignment, PatternFill
 
-from openai import OpenAI
-
-# ===== OpenAI client من الـ secrets =====
-client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+import google.generativeai as genai
 
 # =========================================================
-# 0) CONFIG
+# 0) Gemini CONFIG
+# =========================================================
+
+def get_gemini_model():
+    """
+    تهيئة نموذج Gemini للاستخدام مع الصور.
+    نقرأ المفتاح من:
+      - متغيّر البيئة GEMINI_API_KEY
+      - أو من st.secrets["GEMINI_API_KEY"]
+    لو مش موجود، نرجّع None.
+    """
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        try:
+            api_key = st.secrets["GEMINI_API_KEY"]
+        except Exception:
+            api_key = None
+
+    if not api_key:
+        return None
+
+    genai.configure(api_key=api_key)
+    generation_config = {
+        "response_mime_type": "application/json",
+    }
+    model = genai.GenerativeModel(
+        model_name="gemini-1.5-flash",
+        generation_config=generation_config,
+    )
+    return model
+
+
+# =========================================================
+# 1) CONFIG
 # =========================================================
 
 AUDIT_TEMPLATES = {
@@ -93,7 +123,7 @@ DEFAULT_TESS_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
 
 # =========================================================
-# 1) HELPERS
+# 2) HELPERS
 # =========================================================
 
 def safe_name(s: str) -> str:
@@ -127,6 +157,7 @@ def create_thumbnail(img_path: str) -> str | None:
     try:
         if not img_path or not os.path.exists(img_path):
             return None
+
         base = os.path.basename(img_path)
         name, _ = os.path.splitext(base)
         thumb_path = os.path.join(THUMBS_DIR, f"{name}_thumb.png")
@@ -141,15 +172,14 @@ def create_thumbnail(img_path: str) -> str | None:
 
 
 # =========================================================
-# 2) OCR + AI VISION
+# 3) OCR + GEMINI VISION
 # =========================================================
 
 def preprocess_for_ocr(pil_img: Image.Image) -> np.ndarray:
-    """معالجة أولية للصورة لو استعملنا Tesseract."""
+    """معالجة أولية للصورة لو استعملنا Tesseract (محلي فقط)."""
     img = np.array(pil_img.convert("RGB"))
     img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
-    # تكبير بسيط
     img = cv2.resize(img, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -167,7 +197,7 @@ def preprocess_for_ocr(pil_img: Image.Image) -> np.ndarray:
 
 
 def classic_ocr_text(pil_img: Image.Image) -> str:
-    """Tesseract OCR – لو غير متوفر يرجّع نص فاضي بدون ما يكسر التطبيق."""
+    """Tesseract OCR – على Cloud غالباً فاضي، على اللابتوب ممكن يشتغل."""
     try:
         ensure_tesseract()
         proc = preprocess_for_ocr(pil_img)
@@ -178,79 +208,78 @@ def classic_ocr_text(pil_img: Image.Image) -> str:
         )
         return text or ""
     except pytesseract.pytesseract.TesseractNotFoundError:
-        # على Streamlit Cloud غالبًا رح يصير هيك
         return ""
     except Exception:
         return ""
 
 
-def ai_extract_fields(pil_img: Image.Image) -> tuple[str, dict]:
+def gemini_extract_fields(pil_img: Image.Image) -> tuple[str, dict]:
     """
-    استخدام OpenAI Vision لاستخراج الحقول من صورة الـ Nameplate.
+    استخدام Gemini Vision لاستخراج الحقول من صورة الـ Nameplate.
     يرجّع:
-      - raw_text: النص الخام (JSON أو نص عادي) لعرضه في Raw OCR
+      - raw_text: النص الخام (JSON أو نص) لعرضه في Raw OCR / AI JSON
       - fields: dict فيه Model / Serial / Voltage_V / Current_A / Power_kW / Frequency_Hz
     """
-    try:
-        # تحويل الصورة إلى base64
-        buf = io.BytesIO()
-        pil_img.save(buf, format="JPEG")
-        b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-        img_url = f"data:image/jpeg;base64,{b64}"
+    empty = {
+        "Model": "",
+        "Serial": "",
+        "Voltage_V": "",
+        "Current_A": "",
+        "Power_kW": "",
+        "Frequency_Hz": "",
+    }
 
+    model = get_gemini_model()
+    if model is None:
+        st.info("Gemini API key not configured. AI extraction is disabled.")
+        return "", empty
+
+    try:
         prompt = """
 أنت خبير تدقيق كهربائي. أمامك صورة Nameplate واحدة لجهاز.
-اقرأ كل المعلومات المهمة واستخرج القيم التالية فقط:
+اقرأ المعلومات المكتوبة عليها واستخرج فقط الحقول التالية:
 
-- model       : كود الموديل / type
+- model       : كود الموديل / type بالضبط كما مكتوب (حتى لو فيه شرطات)
 - serial      : الرقم التسلسلي كما هو مكتوب
-- voltage_v   : جهد التغذية بالفولت (رقم واحد؛ لو مكتوب 220-240V خذ قيمة وسطية مثل 230)
-- current_a   : التيار بالأمبير
+- voltage_v   : جهد التغذية بالفولت (رقم واحد؛ لو مكتوب 220-240V خذ قيمة وسطية تقريبية مثل 230)
+- current_a   : التيار بالأمبير (لو أكثر من قيمة اختَر القيمة الرئيسية للـ Rated Current)
 - power_kw    : الاستطاعة بالكيلوواط (لو مكتوب W حوّلها إلى kW بثلاث منازل عشرية)
-- frequency_hz: التردد بالهرتز (50 أو 60 غالبًا)
+- frequency_hz: التردد بالهرتز (غالباً 50 أو 60)
 
-ارْجِع **JSON صالح فقط** بدون أي نص إضافي، مثل الشكل التالي:
+أرجع JSON صالح فقط، بدون أي كلام إضافي، بالشكل التالي:
 
 {
   "model": "TCM80C6PIZ(EX)",
   "serial": "509501000",
   "voltage_v": 230,
   "current_a": 2.0,
-  "power_kw": 0.4,
+  "power_kw": 0.400,
   "frequency_hz": 50
 }
 
 لو حقل غير موجود على النيمبليت، ارجعه بالقيمة null.
 """
 
-        response = client.responses.create(
-            model="gpt-4o-mini",
-            input=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "input_text", "text": prompt},
-                        {"type": "input_image", "image_url": img_url},
-                    ],
-                }
-            ],
-            max_output_tokens=400,
+        # Gemini تقبل مباشرة كائن PIL.Image في generate_content
+        response = model.generate_content(
+            [prompt, pil_img],
         )
 
-        # النص الناتج من الذكاء الاصطناعي (مفروض يكون JSON)
-        raw_text = response.output_text
+        raw_text = response.text or ""
 
         data = {}
         try:
             data = json.loads(raw_text)
         except Exception:
-            # لو رجّع كلام زيادة، نحاول نلقط أقرب {...}
+            # لو رجّع كلام زيادة، نحاول نلقط JSON بين أقواس { }
             m = re.search(r"\{.*\}", raw_text, re.DOTALL)
             if m:
                 try:
                     data = json.loads(m.group(0))
                 except Exception:
                     data = {}
+            else:
+                data = {}
 
         if not isinstance(data, dict):
             data = {}
@@ -266,28 +295,19 @@ def ai_extract_fields(pil_img: Image.Image) -> tuple[str, dict]:
         return raw_text, fields
 
     except Exception as e:
-        # نظهر الخطأ في Streamlit للتشخيص
-        st.error(f"AI vision error: {e}")
-        empty = {
-            "Model": "",
-            "Serial": "",
-            "Voltage_V": "",
-            "Current_A": "",
-            "Power_kW": "",
-            "Frequency_Hz": "",
-        }
+        st.error(f"Gemini vision error: {e}")
         return "", empty
 
 
 def analyze_nameplate(pil_img: Image.Image) -> tuple[str, dict]:
     """
     دالة موحّدة:
-      - تحاول OCR الكلاسيكي (لو موجود)
-      - تستخدم AI Vision
+      - تحاول OCR الكلاسيكي (لو ممكن)
+      - تستخدم Gemini Vision
       - ترجع نص مشترك + الحقول المستخرجة
     """
     classic = classic_ocr_text(pil_img)
-    ai_raw, ai_fields = ai_extract_fields(pil_img)
+    ai_raw, ai_fields = gemini_extract_fields(pil_img)
 
     raw_combined = ""
     if classic:
@@ -295,12 +315,12 @@ def analyze_nameplate(pil_img: Image.Image) -> tuple[str, dict]:
     if ai_raw:
         raw_combined += ai_raw
 
-    # حاليًا نعتمد على AI بشكل أساسي
+    # حالياً نعتمد على Gemini (ai_fields)
     return raw_combined, ai_fields
 
 
 # =========================================================
-# 3) EXCEL EXPORT (مع الصور)
+# 4) EXCEL EXPORT (مع الصور)
 # =========================================================
 
 def build_excel_report(df: pd.DataFrame, out_path: str):
@@ -429,15 +449,14 @@ def build_excel_report(df: pd.DataFrame, out_path: str):
 
 
 # =========================================================
-# 4) STREAMLIT UI
+# 5) STREAMLIT UI
 # =========================================================
 
 st.set_page_config(page_title="Audit Nameplate OCR - Demo", layout="wide")
-st.title("Audit Nameplate OCR - Quick Demo")
+st.title("Audit Nameplate OCR - Quick Demo (Gemini Edition)")
 
 st.write(
-    "Proof-of-concept for your audit flow: "
-    "select audit type → facility → area → upload nameplate → OCR / AI assist → auto log → export Excel."
+    "Flow: select audit type → facility → area → upload nameplate → AI assist (Gemini) → save to CSV → export Excel."
 )
 
 # اختيار نوع الأوديت والمنشأة
@@ -502,7 +521,7 @@ if facility_name and place:
                     use_container_width=True,
                 )
 
-                # 2) تحليل الصورة (OCR الكلاسيكي + AI)
+                # 2) تحليل الصورة (OCR الكلاسيكي + Gemini)
                 with st.spinner("تحليل الصورة واستخراج القيم..."):
                     raw, fields = analyze_nameplate(pil_img)
 
@@ -536,7 +555,7 @@ if facility_name and place:
                 with c5:
                     power = st.text_input(
                         "Power (kW)",
-                        value=fields.get("Power_kW") or "",
+                        value=fields.get("Power_KW") or fields.get("Power_kW") or "",
                         key=f"pwr_{place}_{i}",
                     )
                 with c6:
@@ -601,7 +620,7 @@ if facility_name and place:
                     st.success("Saved! Record added to CSV with local image.")
 
 # =========================================================
-# 5) CURRENT CSV PREVIEW
+# 6) CURRENT CSV PREVIEW
 # =========================================================
 
 st.divider()
@@ -615,7 +634,7 @@ else:
     st.write("No records yet.")
 
 # =========================================================
-# 6) EXPORT EXCEL
+# 7) EXPORT EXCEL
 # =========================================================
 
 st.divider()
