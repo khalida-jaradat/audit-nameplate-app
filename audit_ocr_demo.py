@@ -120,6 +120,7 @@ os.makedirs(THUMBS_DIR, exist_ok=True)
 
 # لو شغّلتيه على ويندوز محلياً
 DEFAULT_TESS_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+LINUX_TESS_CMD = "/usr/bin/tesseract"
 
 
 # =========================================================
@@ -133,13 +134,27 @@ def safe_name(s: str) -> str:
 
 
 def ensure_tesseract():
-    """تهيئة مسار Tesseract لو متوفر (محليًا على ويندوز)."""
+    
+    # لو معيّن من قبل، لا تعودي تعملي إشي
+    if getattr(pytesseract.pytesseract, "tesseract_cmd", None):
+        return
+
+    # 1) من متغيّر البيئة
     env_cmd = os.environ.get("TESSERACT_CMD", "").strip()
     if env_cmd and os.path.exists(env_cmd):
         pytesseract.pytesseract.tesseract_cmd = env_cmd
         return
+
+    # 2) لينكس – Streamlit Cloud
+    if os.path.exists(LINUX_TESS_CMD):
+        pytesseract.pytesseract.tesseract_cmd = LINUX_TESS_CMD
+        return
+
+    # 3) ويندوز – تشغيل محلي على جهازك
     if os.name == "nt" and os.path.exists(DEFAULT_TESS_CMD):
         pytesseract.pytesseract.tesseract_cmd = DEFAULT_TESS_CMD
+        return
+
 
 
 def append_record(row: dict):
@@ -677,4 +692,5 @@ if os.path.exists(CSV_PATH):
         st.info("No records for this facility yet. Save at least one nameplate record.")
 else:
     st.info("No CSV records yet. Save at least one nameplate record first.")
+
 
