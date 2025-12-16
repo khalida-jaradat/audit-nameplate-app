@@ -20,7 +20,6 @@ from openpyxl.styles import Font, Alignment, PatternFill
 
 from openai import OpenAI  # نستخدمه مع OpenRouter
 
-
 # =========================================================
 # 0) CONFIG
 # =========================================================
@@ -86,12 +85,11 @@ THUMBS_DIR = os.path.join(OUTPUT_DIR, "_thumbs")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(THUMBS_DIR, exist_ok=True)
 
-# لو شغالة على ويندوز محليًا وركّبتي Tesseract:
+# لو مستقبلاً شغّلتيه على ويندوز محلي
 DEFAULT_TESS_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
-# موديل جيمناي على OpenRouter
-# لو أعطاك خطأ model not found روحي على docs واختاري الاسم الصحيح وعدّليه هنا
-OPENROUTER_MODEL = "google/gemini-2.5-flash"
+# اسم موديل Gemini على OpenRouter (عدّليه لو اسم الموديل مختلف عندك)
+OPENROUTER_MODEL = "google/gemini-2.0-flash-lite"
 
 
 # =========================================================
@@ -105,7 +103,7 @@ def safe_name(s: str) -> str:
 
 
 def ensure_tesseract():
-    """تهيئة مسار Tesseract لو متوفر (للاستخدام على اللابتوب)."""
+    """تجهيز مسار Tesseract لو متوفر (يفيدك محلياً على ويندوز)."""
     env_cmd = os.environ.get("TESSERACT_CMD", "").strip()
     if env_cmd and os.path.exists(env_cmd):
         pytesseract.pytesseract.tesseract_cmd = env_cmd
@@ -127,7 +125,7 @@ def append_record(row: dict):
 
 
 def create_thumbnail(img_path: str) -> str | None:
-    """إنشاء Thumbnail صغير للصورة لاستخدامه في ملف Excel."""
+    """إنشاء صورة صغيرة لاستخدامها في ملف Excel."""
     try:
         if not img_path or not os.path.exists(img_path):
             return None
@@ -154,7 +152,6 @@ def preprocess_for_ocr(pil_img: Image.Image) -> np.ndarray:
     img = np.array(pil_img.convert("RGB"))
     img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
-    # تكبير الصورة
     img = cv2.resize(img, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -172,7 +169,7 @@ def preprocess_for_ocr(pil_img: Image.Image) -> np.ndarray:
 
 
 def classic_ocr_text(pil_img: Image.Image) -> str:
-    """Tesseract OCR – لو غير متوفر يرجّع نص فاضي بدون ما يكسّر التطبيق."""
+    """Tesseract OCR – لو غير متوفر يرجّع نص فاضي بدون ما يكسر التطبيق."""
     try:
         ensure_tesseract()
         proc = preprocess_for_ocr(pil_img)
@@ -182,22 +179,25 @@ def classic_ocr_text(pil_img: Image.Image) -> str:
             lang="eng",
         )
         return text or ""
-    except pytesseract.pytesseract.TesseractNotFoundError:
-        # على Streamlit Cloud مافي Tesseract – عادي، نرجع نص فاضي
-        return ""
     except Exception:
+        # على Streamlit Cloud هذا غالباً اللي بيصير
         return ""
+
+
+def empty_fields() -> dict:
+    return {
+        "Model": "",
+        "Serial": "",
+        "Voltage_V": "",
+        "Current_A": "",
+        "Power_kW": "",
+        "Frequency_Hz": "",
+    }
 
 
 def get_openrouter_client() -> OpenAI | None:
-    """
-    إنشاء client لـ OpenRouter.
-    يحاول يقرأ OPENROUTER_API_KEY من:
-      1) env vars
-      2) st.secrets (Streamlit Cloud)
-    """
+    """تهيئة كائن OpenAI شغال مع OpenRouter."""
     api_key = os.environ.get("OPENROUTER_API_KEY")
-
     if not api_key:
         try:
             api_key = st.secrets.get("OPENROUTER_API_KEY", None)  # type: ignore[attr-defined]
@@ -207,9 +207,6 @@ def get_openrouter_client() -> OpenAI | None:
     if not api_key:
         return None
 
-    # نخزّنه برضو في الـ env
-    os.environ["OPENROUTER_API_KEY"] = api_key
-
     client = OpenAI(
         base_url="https://openrouter.ai/api/v1",
         api_key=api_key,
@@ -217,38 +214,17 @@ def get_openrouter_client() -> OpenAI | None:
     return client
 
 
-def _extract_json_block(text: str) -> str:
-    """يحاول يلقط بلوك JSON من الرد حتى لو كان حوله كلام."""
-    if not text:
-        return "{}"
-
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        return text[start : end + 1]
-
-    return "{}"
-
-
 def ai_extract_fields(pil_img: Image.Image) -> tuple[str, dict]:
     """
-    استخدام Gemini عبر OpenRouter لاستخراج الحقول من صورة الـ Nameplate.
+    استخدام Gemini عبر OpenRouter لاستخراج القيم.
     يرجّع:
-      - json_text: ستِرنغ فيه الـ JSON (للـ RawOCR)
-      - fields: dict فيه Model / Serial / Voltage_V / Current_A / Power_kW / Frequency_Hz
+      - raw_text: نص الـ JSON الخام (أو فاضي لو فشل)
+      - fields: dict فيه القيم الأساسية
     """
     client = get_openrouter_client()
-    empty_fields = {
-        "Model": "",
-        "Serial": "",
-        "Voltage_V": "",
-        "Current_A": "",
-        "Power_kW": "",
-        "Frequency_Hz": "",
-    }
-
     if client is None:
-        return "", empty_fields
+        st.info("AI extraction is disabled (no OPENROUTER_API_KEY found).")
+        return "", empty_fields()
 
     try:
         # نحول الصورة لـ base64
@@ -256,22 +232,22 @@ def ai_extract_fields(pil_img: Image.Image) -> tuple[str, dict]:
         pil_img.save(buf, format="JPEG")
         b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
 
-        prompt = """
-أنت خبير تدقيق طاقة وكهرباء.
-عندك صورة Nameplate واحدة لجهاز (ثلاجة، مضخة، مروحة، شاشة، إلخ).
+        system_msg = (
+            "You are an electrical audit assistant. "
+            "You read equipment nameplates and return clean JSON only."
+        )
 
-مهمتك:
-1) اقرأ كل النصوص المهمة على الـ nameplate.
-2) استخرج القيم التالية فقط، بدون أي شرح إضافي:
+        user_text = """
+Read the nameplate image and return ONLY a JSON object with these keys:
 
-- model       : كود الموديل / type (نفس ما مكتوب)
-- serial      : الرقم التسلسلي كما هو مكتوب (بدون تعديل)
-- voltage_v   : جهد التغذية بالفولت (رقم واحد؛ لو مكتوب 220-240V خذ 230 مثلاً)
-- current_a   : التيار بالأمبير
-- power_kw    : الاستطاعة بالكيلوواط (لو مكتوب 400 W حوّلها إلى 0.400 kW)
-- frequency_hz: التردد بالهرتز (50 أو 60 غالباً)
+- model        : device model or type code
+- serial       : serial number
+- voltage_v    : supply voltage in volts (single number; if 220-240V, use a typical value like 230)
+- current_a    : current in amps
+- power_kw     : power in kW (if only W is given, convert to kW with 3 decimals)
+- frequency_hz : frequency in Hz
 
-رجّع النتيجة بصيغة JSON فقط، بدون نص قبل أو بعد، وبدون backticks، مثل:
+Example JSON (no extra text, no explanation):
 
 {
   "model": "TCM80C6PIZ(EX)",
@@ -283,67 +259,82 @@ def ai_extract_fields(pil_img: Image.Image) -> tuple[str, dict]:
 }
 """
 
-        completion = client.chat.completions.create(
+        # نرسل طلب Chat Completions (صيغة OpenAI-compatible)
+        resp = client.chat.completions.create(
             model=OPENROUTER_MODEL,
             messages=[
+                {"role": "system", "content": system_msg},
                 {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": prompt},
+                        {"type": "text", "text": user_text},
                         {
-                            "type": "input_image",
-                            "image_url": f"data:image/jpeg;base64,{b64}",
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{b64}"
+                            },
                         },
                     ],
-                }
+                },
             ],
+            temperature=0,
         )
 
-        # ندمج كل أجزاء النص في الرسالة
-        msg_content = completion.choices[0].message.content
-        parts_text = []
-        for part in msg_content:
-            # كائنات الـ SDK لها خاصية text
-            text_part = getattr(part, "text", None)
-            if text_part:
-                parts_text.append(text_part)
+        # نفك الـ response إلى dict عشان ما نتعلّق بأنواع الكلاسات
+        resp_dict = resp.model_dump()
+        msg = resp_dict["choices"][0]["message"]
+        content = msg.get("content", "")
 
-        full_text = "\n".join(parts_text)
-        json_text = _extract_json_block(full_text)
+        if isinstance(content, str):
+            raw_text = content
+        elif isinstance(content, list):
+            # ندمج كل أجزاء النص
+            parts = []
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    parts.append(part.get("text", ""))
+            raw_text = "\n".join(parts)
+        else:
+            raw_text = str(content)
 
-        data = json.loads(json_text)
+        cleaned = raw_text.strip()
+
+        # لو الموديل رجّع ```json ... ``` نشيلها
+        if "```" in cleaned:
+            start = cleaned.find("{")
+            end = cleaned.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                cleaned = cleaned[start : end + 1]
+
+        data = json.loads(cleaned)
 
         fields = {
-            "Model": data.get("model") or "",
-            "Serial": data.get("serial") or "",
-            "Voltage_V": str(data.get("voltage_v") or "") or "",
-            "Current_A": str(data.get("current_a") or "") or "",
-            "Power_kW": str(data.get("power_kw") or "") or "",
-            "Frequency_Hz": str(data.get("frequency_hz") or "") or "",
+            "Model": str(data.get("model") or ""),
+            "Serial": str(data.get("serial") or ""),
+            "Voltage_V": str(data.get("voltage_v") or ""),
+            "Current_A": str(data.get("current_a") or ""),
+            "Power_kW": str(data.get("power_kw") or ""),
+            "Frequency_Hz": str(data.get("frequency_hz") or ""),
         }
-        return json_text, fields
+
+        return cleaned, fields
 
     except Exception as e:
-        # لو صار خطأ (مثلاً quota) نرجع قيم فاضية
-        print("Gemini / OpenRouter vision error:", e)
-        return "", empty_fields
+        # هان رح تشوفي الخطأ لو في مشكلة موديل / كوتا / غيره
+        st.warning(f"AI vision error (OpenRouter): {e}")
+        return "", empty_fields()
 
 
 def analyze_nameplate(pil_img: Image.Image) -> tuple[str, dict]:
-    """
-    دالة موحّدة:
-      - تحاول Tesseract (لو موجود)
-      - تستعمل Gemini عبر OpenRouter
-      - ترجع نص مشترك + الحقول المستخرجة
-    """
-    classic_text = classic_ocr_text(pil_img)
+    """دالة موحّدة: OCR كلاسيكي + AI + دمج النص."""
+    classic = classic_ocr_text(pil_img)
     ai_json, ai_fields = ai_extract_fields(pil_img)
 
     raw_combined = ""
-    if classic_text:
-        raw_combined += classic_text + "\n\n---\n\n"
+    if classic:
+        raw_combined += "[CLASSIC OCR]\n" + classic + "\n\n"
     if ai_json:
-        raw_combined += ai_json
+        raw_combined += "[AI JSON]\n" + ai_json
 
     return raw_combined, ai_fields
 
@@ -353,12 +344,6 @@ def analyze_nameplate(pil_img: Image.Image) -> tuple[str, dict]:
 # =========================================================
 
 def build_excel_report(df: pd.DataFrame, out_path: str):
-    """
-    إنشاء ملف Excel:
-      - شيت لكل Place
-      - أعمدة أساسية + Current
-      - صورة مصغّرة في آخر عمود
-    """
     cols = [
         "Record ID",
         "Place Name",
@@ -384,13 +369,13 @@ def build_excel_report(df: pd.DataFrame, out_path: str):
             2: 18,
             3: 10,
             4: 20,
-            5: 22,
+            5: 24,
             6: 12,
             7: 12,
             8: 12,
             9: 14,
             10: 22,
-            11: 22,
+            11: 24,
             12: 30,
         }
         for col_idx, w in widths.items():
@@ -485,10 +470,9 @@ st.title("Audit Nameplate OCR - Quick Demo")
 
 st.write(
     "Proof-of-concept for your audit flow: "
-    "select audit type → facility → area → upload nameplate → AI extraction → auto log → export Excel."
+    "select audit type → facility → area → upload nameplate → OCR / AI assist → auto log → export Excel."
 )
 
-# اختيار نوع الأوديت والمنشأة
 col1, col2 = st.columns(2)
 with col1:
     audit_type = st.selectbox("Audit Type", list(AUDIT_TEMPLATES.keys()))
@@ -497,7 +481,6 @@ with col2:
 
 default_places = AUDIT_TEMPLATES.get(audit_type, [])
 
-# قائمة الأماكن القابلة للتعديل
 st.divider()
 st.subheader("Audit Components (editable list)")
 places_text = st.text_area(
@@ -510,7 +493,6 @@ places = [p.strip() for p in places_text.splitlines() if p.strip()]
 if not places:
     st.warning("Please add at least one place to continue.")
 
-# اختيار المكان وعدد التكرارات
 st.divider()
 st.subheader("Choose a place to capture nameplates")
 
@@ -541,7 +523,6 @@ if facility_name and place:
             )
 
             if uploaded:
-                # 1) عرض الصورة
                 pil_img = Image.open(uploaded)
                 st.image(
                     pil_img,
@@ -549,11 +530,9 @@ if facility_name and place:
                     use_container_width=True,
                 )
 
-                # 2) تحليل الصورة (Tesseract + Gemini عبر OpenRouter)
-                with st.spinner("Analyzing image and extracting values..."):
+                with st.spinner("Analyzing image (OCR + AI)..."):
                     raw, fields = analyze_nameplate(pil_img)
 
-                # 3) الحقول القابلة للتعديل
                 st.markdown("### Extracted fields (edit if needed)")
                 c1, c2, c3, c4, c5, c6 = st.columns(6)
                 with c1:
@@ -599,11 +578,9 @@ if facility_name and place:
                     key=f"notes_{place}_{i}",
                 )
 
-                # 4) نصّ الـ OCR / JSON
                 with st.expander("Raw OCR / AI JSON"):
                     st.code(raw[:3000] if raw else "")
 
-                # 5) زر الحفظ
                 if st.button(
                     f"Save record for {place} #{i}",
                     key=f"save_{place}_{i}",
