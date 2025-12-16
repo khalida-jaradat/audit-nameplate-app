@@ -18,43 +18,11 @@ from openpyxl.drawing.image import Image as XLImage
 from openpyxl.utils import get_column_letter
 from openpyxl.styles import Font, Alignment, PatternFill
 
-import google.generativeai as genai
-
-# =========================================================
-# 0) Gemini CONFIG
-# =========================================================
-
-def get_gemini_model():
-    """
-    تهيئة نموذج Gemini للاستخدام مع الصور.
-    نقرأ المفتاح من:
-      - متغيّر البيئة GEMINI_API_KEY
-      - أو من st.secrets["GEMINI_API_KEY"]
-    لو مش موجود، نرجّع None.
-    """
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        try:
-            api_key = st.secrets["GEMINI_API_KEY"]
-        except Exception:
-            api_key = None
-
-    if not api_key:
-        return None
-
-    genai.configure(api_key=api_key)
-    generation_config = {
-        "response_mime_type": "application/json",
-    }
-    model = genai.GenerativeModel(
-        model_name="gemini-2.5-flash",
-        generation_config=generation_config,
-    )
-    return model
+from openai import OpenAI  # نستخدمه مع OpenRouter
 
 
 # =========================================================
-# 1) CONFIG
+# 0) CONFIG
 # =========================================================
 
 AUDIT_TEMPLATES = {
@@ -118,13 +86,16 @@ THUMBS_DIR = os.path.join(OUTPUT_DIR, "_thumbs")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(THUMBS_DIR, exist_ok=True)
 
-# لو شغّلتيه على ويندوز محلياً
+# لو شغالة على ويندوز محليًا وركّبتي Tesseract:
 DEFAULT_TESS_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-LINUX_TESS_CMD = "/usr/bin/tesseract"
+
+# موديل جيمناي على OpenRouter
+# لو أعطاك خطأ model not found روحي على docs واختاري الاسم الصحيح وعدّليه هنا
+OPENROUTER_MODEL = "google/gemini-2.5-flash"
 
 
 # =========================================================
-# 2) HELPERS
+# 1) HELPERS
 # =========================================================
 
 def safe_name(s: str) -> str:
@@ -134,27 +105,14 @@ def safe_name(s: str) -> str:
 
 
 def ensure_tesseract():
-    
-    # لو معيّن من قبل، لا تعودي تعملي إشي
-    if getattr(pytesseract.pytesseract, "tesseract_cmd", None):
-        return
-
-    # 1) من متغيّر البيئة
+    """تهيئة مسار Tesseract لو متوفر (للاستخدام على اللابتوب)."""
     env_cmd = os.environ.get("TESSERACT_CMD", "").strip()
     if env_cmd and os.path.exists(env_cmd):
         pytesseract.pytesseract.tesseract_cmd = env_cmd
         return
 
-    # 2) لينكس – Streamlit Cloud
-    if os.path.exists(LINUX_TESS_CMD):
-        pytesseract.pytesseract.tesseract_cmd = LINUX_TESS_CMD
-        return
-
-    # 3) ويندوز – تشغيل محلي على جهازك
     if os.name == "nt" and os.path.exists(DEFAULT_TESS_CMD):
         pytesseract.pytesseract.tesseract_cmd = DEFAULT_TESS_CMD
-        return
-
 
 
 def append_record(row: dict):
@@ -164,11 +122,12 @@ def append_record(row: dict):
         df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
     else:
         df = pd.DataFrame([row])
+
     df.to_csv(CSV_PATH, index=False)
 
 
 def create_thumbnail(img_path: str) -> str | None:
-    """إنشاء ثَمبنيل صغير للصورة لاستخدامه في ملف Excel."""
+    """إنشاء Thumbnail صغير للصورة لاستخدامه في ملف Excel."""
     try:
         if not img_path or not os.path.exists(img_path):
             return None
@@ -187,14 +146,15 @@ def create_thumbnail(img_path: str) -> str | None:
 
 
 # =========================================================
-# 3) OCR + GEMINI VISION
+# 2) OCR + AI VISION
 # =========================================================
 
 def preprocess_for_ocr(pil_img: Image.Image) -> np.ndarray:
-    """معالجة أولية للصورة لو استعملنا Tesseract (محلي فقط)."""
+    """معالجة أولية للصورة لو استعملنا Tesseract."""
     img = np.array(pil_img.convert("RGB"))
     img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
+    # تكبير الصورة
     img = cv2.resize(img, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -212,7 +172,7 @@ def preprocess_for_ocr(pil_img: Image.Image) -> np.ndarray:
 
 
 def classic_ocr_text(pil_img: Image.Image) -> str:
-    """Tesseract OCR – على Cloud غالباً فاضي، على اللابتوب ممكن يشتغل."""
+    """Tesseract OCR – لو غير متوفر يرجّع نص فاضي بدون ما يكسّر التطبيق."""
     try:
         ensure_tesseract()
         proc = preprocess_for_ocr(pil_img)
@@ -223,19 +183,62 @@ def classic_ocr_text(pil_img: Image.Image) -> str:
         )
         return text or ""
     except pytesseract.pytesseract.TesseractNotFoundError:
+        # على Streamlit Cloud مافي Tesseract – عادي، نرجع نص فاضي
         return ""
     except Exception:
         return ""
 
 
-def gemini_extract_fields(pil_img: Image.Image) -> tuple[str, dict]:
+def get_openrouter_client() -> OpenAI | None:
     """
-    استخدام Gemini Vision لاستخراج الحقول من صورة الـ Nameplate.
+    إنشاء client لـ OpenRouter.
+    يحاول يقرأ OPENROUTER_API_KEY من:
+      1) env vars
+      2) st.secrets (Streamlit Cloud)
+    """
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+
+    if not api_key:
+        try:
+            api_key = st.secrets.get("OPENROUTER_API_KEY", None)  # type: ignore[attr-defined]
+        except Exception:
+            api_key = None
+
+    if not api_key:
+        return None
+
+    # نخزّنه برضو في الـ env
+    os.environ["OPENROUTER_API_KEY"] = api_key
+
+    client = OpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=api_key,
+    )
+    return client
+
+
+def _extract_json_block(text: str) -> str:
+    """يحاول يلقط بلوك JSON من الرد حتى لو كان حوله كلام."""
+    if not text:
+        return "{}"
+
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return text[start : end + 1]
+
+    return "{}"
+
+
+def ai_extract_fields(pil_img: Image.Image) -> tuple[str, dict]:
+    """
+    استخدام Gemini عبر OpenRouter لاستخراج الحقول من صورة الـ Nameplate.
     يرجّع:
-      - raw_text: النص الخام (JSON أو نص) لعرضه في Raw OCR / AI JSON
+      - json_text: ستِرنغ فيه الـ JSON (للـ RawOCR)
       - fields: dict فيه Model / Serial / Voltage_V / Current_A / Power_kW / Frequency_Hz
     """
-    empty = {
+    client = get_openrouter_client()
+    empty_fields = {
         "Model": "",
         "Serial": "",
         "Voltage_V": "",
@@ -244,98 +247,109 @@ def gemini_extract_fields(pil_img: Image.Image) -> tuple[str, dict]:
         "Frequency_Hz": "",
     }
 
-    model = get_gemini_model()
-    if model is None:
-        st.info("Gemini API key not configured. AI extraction is disabled.")
-        return "", empty
+    if client is None:
+        return "", empty_fields
 
     try:
+        # نحول الصورة لـ base64
+        buf = io.BytesIO()
+        pil_img.save(buf, format="JPEG")
+        b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+
         prompt = """
-أنت خبير تدقيق كهربائي. أمامك صورة Nameplate واحدة لجهاز.
-اقرأ المعلومات المكتوبة عليها واستخرج فقط الحقول التالية:
+أنت خبير تدقيق طاقة وكهرباء.
+عندك صورة Nameplate واحدة لجهاز (ثلاجة، مضخة، مروحة، شاشة، إلخ).
 
-- model       : كود الموديل / type بالضبط كما مكتوب (حتى لو فيه شرطات)
-- serial      : الرقم التسلسلي كما هو مكتوب
-- voltage_v   : جهد التغذية بالفولت (رقم واحد؛ لو مكتوب 220-240V خذ قيمة وسطية تقريبية مثل 230)
-- current_a   : التيار بالأمبير (لو أكثر من قيمة اختَر القيمة الرئيسية للـ Rated Current)
-- power_kw    : الاستطاعة بالكيلوواط (لو مكتوب W حوّلها إلى kW بثلاث منازل عشرية)
-- frequency_hz: التردد بالهرتز (غالباً 50 أو 60)
+مهمتك:
+1) اقرأ كل النصوص المهمة على الـ nameplate.
+2) استخرج القيم التالية فقط، بدون أي شرح إضافي:
 
-أرجع JSON صالح فقط، بدون أي كلام إضافي، بالشكل التالي:
+- model       : كود الموديل / type (نفس ما مكتوب)
+- serial      : الرقم التسلسلي كما هو مكتوب (بدون تعديل)
+- voltage_v   : جهد التغذية بالفولت (رقم واحد؛ لو مكتوب 220-240V خذ 230 مثلاً)
+- current_a   : التيار بالأمبير
+- power_kw    : الاستطاعة بالكيلوواط (لو مكتوب 400 W حوّلها إلى 0.400 kW)
+- frequency_hz: التردد بالهرتز (50 أو 60 غالباً)
+
+رجّع النتيجة بصيغة JSON فقط، بدون نص قبل أو بعد، وبدون backticks، مثل:
 
 {
   "model": "TCM80C6PIZ(EX)",
   "serial": "509501000",
   "voltage_v": 230,
   "current_a": 2.0,
-  "power_kw": 0.400,
+  "power_kw": 0.4,
   "frequency_hz": 50
 }
-
-لو حقل غير موجود على النيمبليت، ارجعه بالقيمة null.
 """
 
-        # Gemini تقبل مباشرة كائن PIL.Image في generate_content
-        response = model.generate_content(
-            [prompt, pil_img],
+        completion = client.chat.completions.create(
+            model=OPENROUTER_MODEL,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "input_image",
+                            "image_url": f"data:image/jpeg;base64,{b64}",
+                        },
+                    ],
+                }
+            ],
         )
 
-        raw_text = response.text or ""
+        # ندمج كل أجزاء النص في الرسالة
+        msg_content = completion.choices[0].message.content
+        parts_text = []
+        for part in msg_content:
+            # كائنات الـ SDK لها خاصية text
+            text_part = getattr(part, "text", None)
+            if text_part:
+                parts_text.append(text_part)
 
-        data = {}
-        try:
-            data = json.loads(raw_text)
-        except Exception:
-            # لو رجّع كلام زيادة، نحاول نلقط JSON بين أقواس { }
-            m = re.search(r"\{.*\}", raw_text, re.DOTALL)
-            if m:
-                try:
-                    data = json.loads(m.group(0))
-                except Exception:
-                    data = {}
-            else:
-                data = {}
+        full_text = "\n".join(parts_text)
+        json_text = _extract_json_block(full_text)
 
-        if not isinstance(data, dict):
-            data = {}
+        data = json.loads(json_text)
 
         fields = {
-            "Model": str(data.get("model") or ""),
-            "Serial": str(data.get("serial") or ""),
-            "Voltage_V": str(data.get("voltage_v") or ""),
-            "Current_A": str(data.get("current_a") or ""),
-            "Power_kW": str(data.get("power_kw") or ""),
-            "Frequency_Hz": str(data.get("frequency_hz") or ""),
+            "Model": data.get("model") or "",
+            "Serial": data.get("serial") or "",
+            "Voltage_V": str(data.get("voltage_v") or "") or "",
+            "Current_A": str(data.get("current_a") or "") or "",
+            "Power_kW": str(data.get("power_kw") or "") or "",
+            "Frequency_Hz": str(data.get("frequency_hz") or "") or "",
         }
-        return raw_text, fields
+        return json_text, fields
 
     except Exception as e:
-        st.error(f"Gemini vision error: {e}")
-        return "", empty
+        # لو صار خطأ (مثلاً quota) نرجع قيم فاضية
+        print("Gemini / OpenRouter vision error:", e)
+        return "", empty_fields
 
 
 def analyze_nameplate(pil_img: Image.Image) -> tuple[str, dict]:
     """
     دالة موحّدة:
-      - تحاول OCR الكلاسيكي (لو ممكن)
-      - تستخدم Gemini Vision
+      - تحاول Tesseract (لو موجود)
+      - تستعمل Gemini عبر OpenRouter
       - ترجع نص مشترك + الحقول المستخرجة
     """
-    classic = classic_ocr_text(pil_img)
-    ai_raw, ai_fields = gemini_extract_fields(pil_img)
+    classic_text = classic_ocr_text(pil_img)
+    ai_json, ai_fields = ai_extract_fields(pil_img)
 
     raw_combined = ""
-    if classic:
-        raw_combined += classic + "\n\n---\n\n"
-    if ai_raw:
-        raw_combined += ai_raw
+    if classic_text:
+        raw_combined += classic_text + "\n\n---\n\n"
+    if ai_json:
+        raw_combined += ai_json
 
-    # حالياً نعتمد على Gemini (ai_fields)
     return raw_combined, ai_fields
 
 
 # =========================================================
-# 4) EXCEL EXPORT (مع الصور)
+# 3) EXCEL EXPORT (مع الصور)
 # =========================================================
 
 def build_excel_report(df: pd.DataFrame, out_path: str):
@@ -345,7 +359,6 @@ def build_excel_report(df: pd.DataFrame, out_path: str):
       - أعمدة أساسية + Current
       - صورة مصغّرة في آخر عمود
     """
-
     cols = [
         "Record ID",
         "Place Name",
@@ -367,18 +380,18 @@ def build_excel_report(df: pd.DataFrame, out_path: str):
 
     def set_col_widths(ws):
         widths = {
-            1: 10,   # ID
-            2: 18,   # Place
-            3: 10,   # index
-            4: 20,   # Model
-            5: 22,   # Serial
-            6: 12,   # V
-            7: 12,   # A
-            8: 12,   # kW
-            9: 14,   # Hz
-            10: 22,  # timestamp
-            11: 22,  # notes
-            12: 30,  # image
+            1: 10,
+            2: 18,
+            3: 10,
+            4: 20,
+            5: 22,
+            6: 12,
+            7: 12,
+            8: 12,
+            9: 14,
+            10: 22,
+            11: 22,
+            12: 30,
         }
         for col_idx, w in widths.items():
             ws.column_dimensions[get_column_letter(col_idx)].width = w
@@ -464,14 +477,15 @@ def build_excel_report(df: pd.DataFrame, out_path: str):
 
 
 # =========================================================
-# 5) STREAMLIT UI
+# 4) STREAMLIT UI
 # =========================================================
 
 st.set_page_config(page_title="Audit Nameplate OCR - Demo", layout="wide")
-st.title("Mahatta energy audit data system")
+st.title("Audit Nameplate OCR - Quick Demo")
 
 st.write(
-    "Flow: select audit type → facility → area → upload nameplate → AI assist (Gemini) → save to CSV → export Excel."
+    "Proof-of-concept for your audit flow: "
+    "select audit type → facility → area → upload nameplate → AI extraction → auto log → export Excel."
 )
 
 # اختيار نوع الأوديت والمنشأة
@@ -514,7 +528,6 @@ if facility_name and place:
         f"**{facility_name} → {place} (1..{int(count)})**"
     )
 
-# التقط الصور واملا الحقول
 st.divider()
 st.subheader("Capture nameplates")
 
@@ -536,8 +549,8 @@ if facility_name and place:
                     use_container_width=True,
                 )
 
-                # 2) تحليل الصورة (OCR الكلاسيكي + Gemini)
-                with st.spinner("تحليل الصورة واستخراج القيم..."):
+                # 2) تحليل الصورة (Tesseract + Gemini عبر OpenRouter)
+                with st.spinner("Analyzing image and extracting values..."):
                     raw, fields = analyze_nameplate(pil_img)
 
                 # 3) الحقول القابلة للتعديل
@@ -570,7 +583,7 @@ if facility_name and place:
                 with c5:
                     power = st.text_input(
                         "Power (kW)",
-                        value=fields.get("Power_KW") or fields.get("Power_kW") or "",
+                        value=fields.get("Power_kW") or "",
                         key=f"pwr_{place}_{i}",
                     )
                 with c6:
@@ -586,7 +599,7 @@ if facility_name and place:
                     key=f"notes_{place}_{i}",
                 )
 
-                # 4) نصّ الـ OCR / JSON للفلترة اليدوية
+                # 4) نصّ الـ OCR / JSON
                 with st.expander("Raw OCR / AI JSON"):
                     st.code(raw[:3000] if raw else "")
 
@@ -635,7 +648,7 @@ if facility_name and place:
                     st.success("Saved! Record added to CSV with local image.")
 
 # =========================================================
-# 6) CURRENT CSV PREVIEW
+# 5) CURRENT CSV PREVIEW
 # =========================================================
 
 st.divider()
@@ -649,7 +662,7 @@ else:
     st.write("No records yet.")
 
 # =========================================================
-# 7) EXPORT EXCEL
+# 6) EXPORT EXCEL
 # =========================================================
 
 st.divider()
@@ -692,6 +705,3 @@ if os.path.exists(CSV_PATH):
         st.info("No records for this facility yet. Save at least one nameplate record.")
 else:
     st.info("No CSV records yet. Save at least one nameplate record first.")
-
-
-
