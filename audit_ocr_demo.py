@@ -516,23 +516,32 @@ st.subheader("Capture nameplates")
 if facility_name and place:
     for i in range(1, int(count) + 1):
         with st.expander(f"{place} #{i}", expanded=(i == 1)):
+
+            # ⬇⬇ إمّا تصوير بالكاميرا، أو رفع صورة جاهزة
+            camera_photo = st.camera_input(
+                f"Take photo for {place} #{i}",
+                key=f"cam_{audit_type}_{place}_{i}",
+            )
+
             uploaded = st.file_uploader(
-                f"Upload Nameplate image for {place} #{i}",
-                type=["png", "jpg", "jpeg"],
+                f"Or upload existing image for {place} #{i}",
+                type=["png", "jpg", "jpeg", "webp", "heic", "heif"],
                 key=f"upl_{audit_type}_{place}_{i}",
             )
 
-            if uploaded:
-                pil_img = Image.open(uploaded)
-                st.image(
-                    pil_img,
-                    caption="Uploaded image",
-                    use_container_width=True,
-                )
+            # لو في صورة من الكاميرا نستخدمها، غير هيك نستخدم المرفوعة
+            image_file = camera_photo or uploaded
 
+            if image_file is not None:
+                # 1) عرض الصورة
+                pil_img = Image.open(image_file)
+                st.image(pil_img, caption="Uploaded image", use_container_width=True)
+
+                # 2) تحليل الصورة (OCR + AI)
                 with st.spinner("Analyzing image (OCR + AI)..."):
                     raw, fields = analyze_nameplate(pil_img)
 
+                # 3) الحقول المستخرجة (قابلة للتعديل)
                 st.markdown("### Extracted fields (edit if needed)")
                 c1, c2, c3, c4, c5, c6 = st.columns(6)
                 with c1:
@@ -578,9 +587,11 @@ if facility_name and place:
                     key=f"notes_{place}_{i}",
                 )
 
+                # 4) نص الـ OCR / JSON الخام
                 with st.expander("Raw OCR / AI JSON"):
                     st.code(raw[:3000] if raw else "")
 
+                # 5) الحفظ
                 if st.button(
                     f"Save record for {place} #{i}",
                     key=f"save_{place}_{i}",
@@ -682,4 +693,5 @@ if os.path.exists(CSV_PATH):
         st.info("No records for this facility yet. Save at least one nameplate record.")
 else:
     st.info("No CSV records yet. Save at least one nameplate record first.")
+
 
