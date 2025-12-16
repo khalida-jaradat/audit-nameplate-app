@@ -471,8 +471,8 @@ def build_excel_report(df: pd.DataFrame, out_path: str):
 # 4) STREAMLIT UI
 # =========================================================
 
-st.set_page_config(page_title="Audit Nameplate OCR - Demo", layout="wide")
-st.title("Audit Nameplate OCR - Quick Demo")
+st.set_page_config(page_title="Mahatta Energy Audit Data System", layout="wide")
+st.title("Mahatta Energy Audit Data System")
 
 st.write(
     "Proof-of-concept for your audit flow: "
@@ -723,3 +723,4 @@ if os.path.exists(CSV_PATH):
         st.info("No records for this facility yet. Save at least one nameplate record.")
 else:
     st.info("No CSV records yet. Save at least one nameplate record first.")
+
