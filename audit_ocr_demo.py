@@ -480,26 +480,28 @@ with col1:
 with col2:
     facility_name = st.text_input("Facility Name", placeholder="e.g., Demo Factory")
 
-default_places = AUDIT_TEMPLATES.get(audit_type, [])
+# الأماكن الأساسية حسب نوع المنشأة (لا تظهر للمستخدم)
+base_places = AUDIT_TEMPLATES.get(audit_type, [])
 
-# ---------------------------------------------------------
-# (1) Audit Components – صندوق فاضي مع placeholder فقط
-# ---------------------------------------------------------
 st.divider()
-st.subheader("Audit Components (editable list)")
-
-placeholder_text = "\n".join(default_places) if default_places else "Lobby\nKitchen\nBoiler Room"
+st.subheader("Audit Components")
 
 places_text = st.text_area(
-    "One place per line",
-    value="",                      # فاضي افتراضياً
-    placeholder=placeholder_text,  # بس توضيح، مش قيم حقيقية
+    "If there are ADDITIONAL areas, type one per line here (optional) "
+    "اذا في مناطق إضافية اكتبها هنا (سطر لكل منطقة):",
+    value="",      # فاضي تماماً
     height=180,
 )
-places = [p.strip() for p in places_text.splitlines() if p.strip()]
 
+# الأماكن الإضافية اللي بيكتبها المستخدم
+extra_places = [p.strip() for p in places_text.splitlines() if p.strip()]
+
+# القائمة النهائية اللي بنستخدمها في الـ selectbox
+places = base_places + extra_places
+
+# احتياط: لو نوع الأوديت ما إله أماكن جاهزة وما كتبتي شيء
 if not places:
-    st.warning("Please add at least one place (one per line).")
+    st.warning("No places defined yet. Please type at least one area.")
 
 # ---------------------------------------------------------
 # اختيار المكان + عدد التكرارات + اسم مخصص اختياري
@@ -727,4 +729,5 @@ if os.path.exists(CSV_PATH):
         st.info("No records for this facility yet. Save at least one nameplate record.")
 else:
     st.info("No CSV records yet. Save at least one nameplate record first.")
+
 
