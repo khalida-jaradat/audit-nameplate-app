@@ -89,7 +89,7 @@ os.makedirs(THUMBS_DIR, exist_ok=True)
 DEFAULT_TESS_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
 # اسم موديل Gemini على OpenRouter (عدّليه لو اسم الموديل مختلف عندك)
-OPENROUTER_MODEL = "google/gemini-2.0-flash-lite"
+OPENROUTER_MODEL = "google/gemini-2.5-flash-lite"
 
 
 # =========================================================
@@ -682,3 +682,4 @@ if os.path.exists(CSV_PATH):
         st.info("No records for this facility yet. Save at least one nameplate record.")
 else:
     st.info("No CSV records yet. Save at least one nameplate record first.")
+
