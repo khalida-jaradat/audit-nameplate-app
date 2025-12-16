@@ -84,13 +84,17 @@ THUMBS_DIR = os.path.join(OUTPUT_DIR, "_thumbs")
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(THUMBS_DIR, exist_ok=True)
-
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY") or st.secrets.get(
+    "OPENROUTER_API_KEY", ""
+)
 # لو بتشغّلي محلياً على ويندوز وركّبتي Tesseract:
 DEFAULT_TESS_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
 # موديل OpenRouter اللي بتستخدميه (يشتغل مع مفتاحك من openrouter.ai)
-OPENROUTER_MODEL = "google/gemini-2.5-flash-exp"
-
+OPENROUTER_MODEL = "google/gemini-2.5-flash"
+OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_SITE = "https://dk7htkk4qh6yhfjzv6.streamlit.app"  # رابط تطبيقك
+OPENROUTER_APP_NAME = "Audit Nameplate App"
 
 # =========================================================
 # 1) HELPERS
@@ -195,17 +199,9 @@ def get_openrouter_key() -> str | None:
         except Exception:
             key = None
     return key
-
-
-def ai_extract_fields(pil_img: Image.Image) -> tuple[str, dict]:
-    """
-    استخدام OpenRouter + Gemini لاستخراج الحقول من صورة الـ Nameplate.
-    يرجّع:
-      - json_text: سترنغ JSON خام (للعرض في RawOCR)
-      - fields: dict فيه Model / Serial / Voltage_V / Current_A / Power_kW / Frequency_Hz
-    """
-    api_key = get_openrouter_key()
-    empty = {
+    
+def _empty_fields():
+    return {
         "Model": "",
         "Serial": "",
         "Voltage_V": "",
@@ -214,42 +210,54 @@ def ai_extract_fields(pil_img: Image.Image) -> tuple[str, dict]:
         "Frequency_Hz": "",
     }
 
+def ai_extract_fields(pil_img: Image.Image) -> tuple[str, dict]:
+    """
+    استدعاء Gemini عبر OpenRouter لاستخراج:
+    Model, Serial, Voltage_V, Current_A, Power_kW, Frequency_Hz
+    """
+    api_key = OPENROUTER_API_KEY
     if not api_key:
-        # ما في API key
-        return "", empty
+        # ما في API key = ما في AI
+        return "", _empty_fields()
 
     try:
-        # تحويل الصورة لـ base64
+        # نحول الصورة لـ base64
         buf = io.BytesIO()
         pil_img.save(buf, format="JPEG")
         b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
 
         prompt = """
 You are an electrical audit expert.
-You see ONE equipment nameplate photo.
+You get ONE nameplate image of an electrical / mechanical device.
 
-Read it carefully and extract ONLY these fields:
+Extract ONLY these fields and return STRICT JSON (no extra text):
 
-- model       : model or type code
-- serial      : serial number exactly as printed
-- voltage_v   : supply voltage in volts (single number; if 220-240V, use 230)
-- current_a   : current in amps
-- power_kw    : power in kW (if only W appears, convert W → kW to 3 decimals)
-- frequency_hz: frequency in Hz
-
-Return ONLY valid JSON like:
 {
-  "model": "TCM80C6PIZ(EX)",
-  "serial": "509501000",
+  "model": "...",
+  "serial": "...",
   "voltage_v": 230,
   "current_a": 2.0,
   "power_kw": 0.4,
   "frequency_hz": 50
 }
 
-If a field is missing on the plate, set it to null.
-Do NOT add any explanation or extra text outside the JSON.
+Rules:
+- voltage_v: main supply voltage in volts (if '220-240V', return 230).
+- current_a: rated current in amperes (A).
+- power_kw: rated power in kilowatts. If only W is written, convert to kW with 3 decimals.
+- frequency_hz: frequency in Hz (normally 50 or 60).
+- If any field is missing on the label, return null for that field.
+Return ONLY valid JSON.
 """
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            # هدول بس لتوثيق التطبيق عند OpenRouter (مش إلزاميين 100٪ بس ممتازين)
+            "HTTP-Referer": OPENROUTER_SITE,
+            "X-Title": OPENROUTER_APP_NAME,
+        }
 
         payload = {
             "model": OPENROUTER_MODEL,
@@ -257,60 +265,75 @@ Do NOT add any explanation or extra text outside the JSON.
                 {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": prompt},
                         {
-                            "type": "input_image",
-                            "image_url": f"data:image/jpeg;base64,{b64}",
+                            "type": "text",
+                            "text": prompt,
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{b64}"
+                            },
                         },
                     ],
                 }
             ],
-        }
-
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            # اختيارية بس مفيدة لـ OpenRouter
-            "HTTP-Referer": "https://your-streamlit-app.example",
-            "X-Title": "Audit Nameplate OCR",
+            "stream": False,
+            # ما بنستخدم response_format عشان ما نكسر الـ API
+            "max_tokens": 300,
         }
 
         resp = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
+            OPENROUTER_ENDPOINT,
             headers=headers,
             json=payload,
-            timeout=60,
+            timeout=40,
         )
         resp.raise_for_status()
         data = resp.json()
 
-        # نأخذ أول رسالة من الـ choices
-        message = data["choices"][0]["message"]
-        content = message.get("content", "")
+        # OpenRouter بيرجع المحتوى كـ string أو list أجزاء
+        content = data["choices"][0]["message"]["content"]
 
         if isinstance(content, list):
-            text_parts = [c.get("text", "") for c in content if isinstance(c, dict)]
-            text = "".join(text_parts)
-        else:
-            text = str(content)
+            # نجمع كل النصوص في سترنغ واحد
+            text_parts = []
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    text_parts.append(part.get("text", ""))
+                elif isinstance(part, str):
+                    text_parts.append(part)
+            content = "\n".join(text_parts)
+        elif not isinstance(content, str):
+            content = str(content)
 
-        json_text = text.strip()
-        parsed = json.loads(json_text)
+        # نحاول نلقط JSON بين أول { وآخر }
+        json_text = content
+        m = re.search(r"\{.*\}", content, re.DOTALL)
+        if m:
+            json_text = m.group(0)
+
+        try:
+            parsed = json.loads(json_text)
+        except Exception:
+            # لو النموذج حكى كلام، نرجّع حقول فاضية
+            return content, _empty_fields()
 
         fields = {
-            "Model": parsed.get("model") or "",
-            "Serial": parsed.get("serial") or "",
-            "Voltage_V": str(parsed.get("voltage_v") or "") or "",
-            "Current_A": str(parsed.get("current_a") or "") or "",
-            "Power_kW": str(parsed.get("power_kw") or "") or "",
-            "Frequency_Hz": str(parsed.get("frequency_hz") or "") or "",
+            "Model": str(parsed.get("model") or ""),
+            "Serial": str(parsed.get("serial") or ""),
+            "Voltage_V": str(parsed.get("voltage_v") or ""),
+            "Current_A": str(parsed.get("current_a") or ""),
+            "Power_kW": str(parsed.get("power_kw") or ""),
+            "Frequency_Hz": str(parsed.get("frequency_hz") or ""),
         }
-        return json_text, fields
+
+        return content, fields
 
     except Exception as e:
-        # رسالة بسيطة في الواجهة للمساعدة في الديبَغ
+        # عشان لو رجع 400/429/غيره، ما يكسر التطبيق
         st.warning(f"AI vision error: {e}")
-        return "", empty
+        return "", _empty_fields()
 
 
 def analyze_nameplate(pil_img: Image.Image) -> tuple[str, dict]:
@@ -729,6 +752,7 @@ if os.path.exists(CSV_PATH):
         st.info("No records for this facility yet. Save at least one nameplate record.")
 else:
     st.info("No CSV records yet. Save at least one nameplate record first.")
+
 
 
 
