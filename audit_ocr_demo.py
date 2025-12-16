@@ -12,13 +12,13 @@ from PIL import Image
 import cv2
 import numpy as np
 import pytesseract
-import requests
 
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image as XLImage
 from openpyxl.utils import get_column_letter
 from openpyxl.styles import Font, Alignment, PatternFill
 
+import requests
 
 # =========================================================
 # 0) CONFIG
@@ -84,17 +84,10 @@ THUMBS_DIR = os.path.join(OUTPUT_DIR, "_thumbs")
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(THUMBS_DIR, exist_ok=True)
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY") or st.secrets.get(
-    "OPENROUTER_API_KEY", ""
-)
-# لو بتشغّلي محلياً على ويندوز وركّبتي Tesseract:
+
+# لو اشتغلتي محلي على ويندوز
 DEFAULT_TESS_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
-# موديل OpenRouter اللي بتستخدميه (يشتغل مع مفتاحك من openrouter.ai)
-OPENROUTER_MODEL = "google/gemini-2.5-flash"
-OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
-OPENROUTER_SITE = "https://dk7htkk4qh6yhfjzv6.streamlit.app"  # رابط تطبيقك
-OPENROUTER_APP_NAME = "Audit Nameplate App"
 
 # =========================================================
 # 1) HELPERS
@@ -107,7 +100,7 @@ def safe_name(s: str) -> str:
 
 
 def ensure_tesseract():
-    """تهيئة مسار Tesseract لو متوفر (محليًا على ويندوز)."""
+    """تهيئة مسار Tesseract لو متوفر (يفيد على اللابتوب)."""
     env_cmd = os.environ.get("TESSERACT_CMD", "").strip()
     if env_cmd and os.path.exists(env_cmd):
         pytesseract.pytesseract.tesseract_cmd = env_cmd
@@ -148,7 +141,7 @@ def create_thumbnail(img_path: str) -> str | None:
 
 
 # =========================================================
-# 2) OCR + AI VISION
+# 2) OCR + AI VISION (OpenRouter + Gemini 2.5)
 # =========================================================
 
 def preprocess_for_ocr(pil_img: Image.Image) -> np.ndarray:
@@ -184,22 +177,18 @@ def classic_ocr_text(pil_img: Image.Image) -> str:
             lang="eng",
         )
         return text or ""
-    except pytesseract.pytesseract.TesseractNotFoundError:
-        return ""
     except Exception:
         return ""
 
 
-def get_openrouter_key() -> str | None:
-    """قراءة الـ API key من environment أو من Streamlit secrets."""
-    key = os.environ.get("OPENROUTER_API_KEY")
-    if not key:
-        try:
-            key = st.secrets["OPENROUTER_API_KEY"]  # type: ignore[index]
-        except Exception:
-            key = None
-    return key
-    
+# إعدادات OpenRouter (تحطي OPENROUTER_API_KEY كسِر في Streamlit)
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY") or ""
+OPENROUTER_MODEL = "google/gemini-2.5-flash"
+OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_SITE = "https://dk7htkk4qh6yhfjzv6.streamlit.app"
+OPENROUTER_APP_NAME = "Audit Nameplate App"
+
+
 def _empty_fields():
     return {
         "Model": "",
@@ -210,18 +199,20 @@ def _empty_fields():
         "Frequency_Hz": "",
     }
 
+
 def ai_extract_fields(pil_img: Image.Image) -> tuple[str, dict]:
     """
-    استدعاء Gemini عبر OpenRouter لاستخراج:
-    Model, Serial, Voltage_V, Current_A, Power_kW, Frequency_Hz
+    استخدام Gemini عبر OpenRouter لاستخراج الحقول من صورة الـ Nameplate.
+    يرجّع:
+      - raw_text: نص كامل (اللي رجعه الموديل)
+      - fields: dict فيه Model / Serial / Voltage_V / Current_A / Power_kW / Frequency_Hz
     """
-    api_key = OPENROUTER_API_KEY
+    api_key = OPENROUTER_API_KEY or os.environ.get("OPENROUTER_API_KEY")
     if not api_key:
-        # ما في API key = ما في AI
         return "", _empty_fields()
 
     try:
-        # نحول الصورة لـ base64
+        # تحويل الصورة لـ base64
         buf = io.BytesIO()
         pil_img.save(buf, format="JPEG")
         b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
@@ -254,7 +245,6 @@ Return ONLY valid JSON.
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
             "Accept": "application/json",
-            # هدول بس لتوثيق التطبيق عند OpenRouter (مش إلزاميين 100٪ بس ممتازين)
             "HTTP-Referer": OPENROUTER_SITE,
             "X-Title": OPENROUTER_APP_NAME,
         }
@@ -265,10 +255,7 @@ Return ONLY valid JSON.
                 {
                     "role": "user",
                     "content": [
-                        {
-                            "type": "text",
-                            "text": prompt,
-                        },
+                        {"type": "text", "text": prompt},
                         {
                             "type": "image_url",
                             "image_url": {
@@ -279,24 +266,19 @@ Return ONLY valid JSON.
                 }
             ],
             "stream": False,
-            # ما بنستخدم response_format عشان ما نكسر الـ API
             "max_tokens": 300,
         }
 
         resp = requests.post(
-            OPENROUTER_ENDPOINT,
-            headers=headers,
-            json=payload,
-            timeout=40,
+            OPENROUTER_ENDPOINT, headers=headers, json=payload, timeout=40
         )
         resp.raise_for_status()
         data = resp.json()
 
-        # OpenRouter بيرجع المحتوى كـ string أو list أجزاء
         content = data["choices"][0]["message"]["content"]
 
+        # OpenRouter أحياناً يرجع قائمة أجزاء
         if isinstance(content, list):
-            # نجمع كل النصوص في سترنغ واحد
             text_parts = []
             for part in content:
                 if isinstance(part, dict) and part.get("type") == "text":
@@ -307,7 +289,6 @@ Return ONLY valid JSON.
         elif not isinstance(content, str):
             content = str(content)
 
-        # نحاول نلقط JSON بين أول { وآخر }
         json_text = content
         m = re.search(r"\{.*\}", content, re.DOTALL)
         if m:
@@ -316,7 +297,7 @@ Return ONLY valid JSON.
         try:
             parsed = json.loads(json_text)
         except Exception:
-            # لو النموذج حكى كلام، نرجّع حقول فاضية
+            # لو فشل الـ JSON، نخزن النص الخام فقط
             return content, _empty_fields()
 
         fields = {
@@ -327,30 +308,28 @@ Return ONLY valid JSON.
             "Power_kW": str(parsed.get("power_kw") or ""),
             "Frequency_Hz": str(parsed.get("frequency_hz") or ""),
         }
-
         return content, fields
 
     except Exception as e:
-        # عشان لو رجع 400/429/غيره، ما يكسر التطبيق
-        st.warning(f"AI vision error: {e}")
+        print("AI vision error:", e)
         return "", _empty_fields()
 
 
 def analyze_nameplate(pil_img: Image.Image) -> tuple[str, dict]:
     """
     دالة موحّدة:
-      - تحاول Tesseract (لو موجود محليًا) ← نص
-      - تستعمل OpenRouter / Gemini ← JSON منظم
-      - ترجع نص مشترك + الحقول المستخرجة
+      - تحاول Tesseract (لو موجود)
+      - تستعمل AI Vision عبر OpenRouter
+      - ترجع نص مشترك + الحقول المستخرجة (من AI)
     """
     classic = classic_ocr_text(pil_img)
-    ai_json, ai_fields = ai_extract_fields(pil_img)
+    ai_raw, ai_fields = ai_extract_fields(pil_img)
 
     raw_combined = ""
     if classic:
         raw_combined += classic + "\n\n---\n\n"
-    if ai_json:
-        raw_combined += ai_json
+    if ai_raw:
+        raw_combined += ai_raw
 
     return raw_combined, ai_fields
 
@@ -363,13 +342,14 @@ def build_excel_report(df: pd.DataFrame, out_path: str):
     """
     إنشاء ملف Excel:
       - شيت لكل Place
-      - أعمدة أساسية + Current
+      - أعمدة أساسية + AreaName
       - صورة مصغّرة في آخر عمود
     """
 
     cols = [
         "Record ID",
         "Place Name",
+        "Area Name",
         "PlaceIndex",
         "Model",
         "Serial",
@@ -390,16 +370,17 @@ def build_excel_report(df: pd.DataFrame, out_path: str):
         widths = {
             1: 10,   # ID
             2: 18,   # Place
-            3: 10,   # index
-            4: 20,   # Model
-            5: 22,   # Serial
-            6: 12,   # V
-            7: 12,   # A
-            8: 12,   # kW
-            9: 14,   # Hz
-            10: 22,  # timestamp
-            11: 22,  # notes
-            12: 30,  # image
+            3: 22,   # Area
+            4: 10,   # index
+            5: 20,   # Model
+            6: 22,   # Serial
+            7: 12,   # V
+            8: 12,   # A
+            9: 12,   # kW
+            10: 14,  # Hz
+            11: 22,  # timestamp
+            12: 22,  # notes
+            13: 30,  # image
         }
         for col_idx, w in widths.items():
             ws.column_dimensions[get_column_letter(col_idx)].width = w
@@ -435,6 +416,7 @@ def build_excel_report(df: pd.DataFrame, out_path: str):
             record_id = f"{rec_counter:03d}"
             rec_counter += 1
 
+            area_name = row.get("AreaName", "")
             place_index = row.get("PlaceIndex", "")
             model = row.get("Model", "")
             serial = row.get("Serial", "")
@@ -450,6 +432,7 @@ def build_excel_report(df: pd.DataFrame, out_path: str):
                 [
                     record_id,
                     place,
+                    area_name,
                     place_index,
                     model,
                     serial,
@@ -478,7 +461,7 @@ def build_excel_report(df: pd.DataFrame, out_path: str):
                 except Exception:
                     pass
 
-            for c in range(1, len(cols)):
+            for c in range(1, len(cols)):  # آخر عمود للصورة ما بنعمله alignment
                 ws.cell(row=r, column=c).alignment = center
 
     wb.save(out_path)
@@ -493,7 +476,7 @@ st.title("Audit Nameplate OCR - Quick Demo")
 
 st.write(
     "Proof-of-concept for your audit flow: "
-    "select audit type → facility → area → capture/upload nameplate → AI assist → auto log → export Excel."
+    "select audit type → facility → area → capture or upload nameplate → OCR / AI assist → auto log → export Excel."
 )
 
 # اختيار نوع الأوديت والمنشأة
@@ -503,91 +486,89 @@ with col1:
 with col2:
     facility_name = st.text_input("Facility Name", placeholder="e.g., Demo Factory")
 
-# الأماكن الأساسية حسب نوع المنشأة (لا تظهر للمستخدم)
-base_places = AUDIT_TEMPLATES.get(audit_type, [])
+default_places = AUDIT_TEMPLATES.get(audit_type, [])
 
+# قائمة الأماكن القابلة للتعديل (بدون قيم جاهزة، بس Placeholder)
 st.divider()
-st.subheader("Audit Components")
+st.subheader("Audit Components (editable list)")
+
+placeholder_text = (
+    "Example:\n" + "\n".join(default_places)
+    if default_places
+    else "Lobby\nKitchen\nBoiler Room"
+)
 
 places_text = st.text_area(
-    "If there are ADDITIONAL areas, type one per line here (optional) "
-    "اذا في مناطق إضافية اكتبها هنا (سطر لكل منطقة):",
-    value="",      # فاضي تماماً
+    "Custom / additional places for this facility (one per line)",
+    value="",
+    placeholder=placeholder_text,
     height=180,
 )
 
-# الأماكن الإضافية اللي بيكتبها المستخدم
-extra_places = [p.strip() for p in places_text.splitlines() if p.strip()]
+# المستخدم هو اللي يكتب كل الأماكن
+places = [p.strip() for p in places_text.splitlines() if p.strip()]
 
-# القائمة النهائية اللي بنستخدمها في الـ selectbox
-places = base_places + extra_places
-
-# احتياط: لو نوع الأوديت ما إله أماكن جاهزة وما كتبتي شيء
 if not places:
-    st.warning("No places defined yet. Please type at least one area.")
+    st.warning("Please add at least one place (one per line).")
 
-# ---------------------------------------------------------
-# اختيار المكان + عدد التكرارات + اسم مخصص اختياري
-# ---------------------------------------------------------
+# اختيار المكان + اسم المنطقة الفرعي
 st.divider()
 st.subheader("Choose a place to capture nameplates")
 
 place = st.selectbox("Place (from your list)", places) if places else None
-count = st.number_input(
-    "How many instances of this place?",
-    min_value=1,
-    max_value=20,
-    value=1,
-)
+count = 1  # دايمًا واحد – ما في عدد تكرارات
 
-# (2) اسم منطقة مخصص اختياري
-custom_place_label = st.text_input(
-    "Custom area name (optional) – e.g., Main Kitchen, West Lobby",
-    value="",
-)
-
+custom_area = ""
 if facility_name and place:
-    display_place_name = custom_place_label.strip() or place
-    st.info(
-        f"You will capture nameplates for: "
-        f"**{facility_name} → {display_place_name} (1..{int(count)})**"
+    custom_area = st.text_input(
+        "Custom area name (optional) – e.g., Main Kitchen, West Lobby",
+        value="",
+        key=f"area_{facility_name or 'fac'}_{place or 'place'}",
     )
 
-# ---------------------------------------------------------
-# التقاط / رفع الصور
-# ---------------------------------------------------------
+    place_label = (
+        f"{place} – {custom_area.strip()}" if custom_area.strip() else place
+    )
+
+    st.info(
+        f"You will capture nameplates for: "
+        f"**{facility_name} → {place_label}**"
+    )
+
 st.divider()
 st.subheader("Capture nameplates")
 
 if facility_name and place:
-    display_place_name = custom_place_label.strip() or place
+    place_label = (
+        f"{place} – {custom_area.strip()}" if custom_area.strip() else place
+    )
 
-    for i in range(1, int(count) + 1):
-        with st.expander(f"{display_place_name} #{i}", expanded=(i == 1)):
-            # تصوير مباشر من الكاميرا (مفيد على الموبايل)
+    for i in range(1, count + 1):  # دايمًا 1
+        with st.expander(f"{place_label} #{i}", expanded=True):
+            # تصوير مباشر من الكاميرا (مهم للموبايل)
             camera_photo = st.camera_input(
-                f"Take photo for {display_place_name} #{i}",
-                key=f"cam_{audit_type}_{display_place_name}_{i}",
+                f"Take photo for {place_label}",
+                key=f"cam_{audit_type}_{place}_{i}",
             )
 
             # أو رفع صورة موجودة
             uploaded = st.file_uploader(
-                f"Or upload existing image for {display_place_name} #{i}",
-                type=["png", "jpg", "jpeg", "webp"],
-                key=f"upl_{audit_type}_{display_place_name}_{i}",
+                f"Or upload existing image for {place_label}",
+                type=["png", "jpg", "jpeg", "webp", "heic", "heif"],
+                key=f"upl_{audit_type}_{place}_{i}",
             )
 
             image_file = camera_photo or uploaded
 
-            if image_file is not None:
+            if image_file:
                 pil_img = Image.open(image_file)
                 st.image(
                     pil_img,
-                    caption="Captured / uploaded image",
+                    caption="Uploaded image",
                     use_container_width=True,
                 )
 
-                # تحليل الصورة (OCR + AI)
+                # تحليل الصورة
                 with st.spinner("Analyzing image (OCR + AI)..."):
                     raw, fields = analyze_nameplate(pil_img)
 
@@ -598,56 +579,56 @@ if facility_name and place:
                     model = st.text_input(
                         "Model",
                         value=fields.get("Model") or "",
-                        key=f"model_{display_place_name}_{i}",
+                        key=f"model_{place}_{i}",
                     )
                 with c2:
                     serial = st.text_input(
                         "Serial",
                         value=fields.get("Serial") or "",
-                        key=f"serial_{display_place_name}_{i}",
+                        key=f"serial_{place}_{i}",
                     )
                 with c3:
                     voltage = st.text_input(
                         "Voltage (V)",
                         value=fields.get("Voltage_V") or "",
-                        key=f"volt_{display_place_name}_{i}",
+                        key=f"volt_{place}_{i}",
                     )
                 with c4:
                     current = st.text_input(
                         "Current (A)",
                         value=fields.get("Current_A") or "",
-                        key=f"curr_{display_place_name}_{i}",
+                        key=f"curr_{place}_{i}",
                     )
                 with c5:
                     power = st.text_input(
                         "Power (kW)",
                         value=fields.get("Power_kW") or "",
-                        key=f"pwr_{display_place_name}_{i}",
+                        key=f"pwr_{place}_{i}",
                     )
                 with c6:
                     freq = st.text_input(
                         "Frequency (Hz)",
                         value=fields.get("Frequency_Hz") or "",
-                        key=f"hz_{display_place_name}_{i}",
+                        key=f"hz_{place}_{i}",
                     )
 
                 notes = st.text_input(
                     "Notes (optional)",
                     value="",
-                    key=f"notes_{display_place_name}_{i}",
+                    key=f"notes_{place}_{i}",
                 )
 
-                # نص الـ OCR / JSON الخام
+                # نص خام لو حبيتي تراجعيه
                 with st.expander("Raw OCR / AI JSON"):
                     st.code(raw[:3000] if raw else "")
 
                 # زر الحفظ
                 if st.button(
-                    f"Save record for {display_place_name} #{i}",
-                    key=f"save_{display_place_name}_{i}",
+                    f"Save record for {place_label}",
+                    key=f"save_{place}_{i}",
                 ):
                     safe_fac = safe_name(facility_name)
-                    safe_place = safe_name(display_place_name)
+                    safe_place = safe_name(place)
 
                     dir_path = os.path.join(
                         OUTPUT_DIR,
@@ -665,7 +646,8 @@ if facility_name and place:
                         "Timestamp": datetime.now().isoformat(timespec="seconds"),
                         "AuditType": audit_type,
                         "Facility": facility_name,
-                        "Place": display_place_name,
+                        "Place": place,
+                        "AreaName": custom_area.strip(),
                         "PlaceIndex": i,
                         "Model": model,
                         "Serial": serial,
@@ -686,7 +668,7 @@ if facility_name and place:
                     st.success("Saved! Record added to CSV with local image.")
 
 # =========================================================
-# 5) CURRENT CSV PREVIEW – فقط للـ Facility الحالية
+# 5) CURRENT CSV PREVIEW
 # =========================================================
 
 st.divider()
@@ -696,20 +678,17 @@ if os.path.exists(CSV_PATH):
     df_all = pd.read_csv(CSV_PATH)
 
     if facility_name:
-        df_prev = df_all[df_all["Facility"] == facility_name].copy()
+        df_preview = df_all[df_all["Facility"] == facility_name].copy()
     else:
-        df_prev = df_all.copy()
+        df_preview = df_all.copy()
 
-    if df_prev.empty:
-        st.info("No records yet for this facility.")
-    else:
-        st.dataframe(df_prev.tail(50), use_container_width=True)
-        st.caption(f"Saved at: {CSV_PATH}")
+    st.dataframe(df_preview.tail(50), use_container_width=True)
+    st.caption(f"Saved at: {CSV_PATH}")
 else:
     st.write("No records yet.")
 
 # =========================================================
-# 6) EXPORT EXCEL – برضو مفلتر على نفس الـ Facility
+# 6) EXPORT EXCEL
 # =========================================================
 
 st.divider()
@@ -731,7 +710,7 @@ if os.path.exists(CSV_PATH):
         )
 
         if st.button("Generate Excel with embedded images"):
-            for col in ["Notes", "RawOCR", "Current_A"]:
+            for col in ["Notes", "RawOCR", "Current_A", "AreaName"]:
                 if col not in df_use.columns:
                     df_use[col] = ""
 
@@ -752,7 +731,3 @@ if os.path.exists(CSV_PATH):
         st.info("No records for this facility yet. Save at least one nameplate record.")
 else:
     st.info("No CSV records yet. Save at least one nameplate record first.")
-
-
-
-
