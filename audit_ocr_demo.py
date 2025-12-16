@@ -85,7 +85,6 @@ THUMBS_DIR = os.path.join(OUTPUT_DIR, "_thumbs")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(THUMBS_DIR, exist_ok=True)
 
-# لو اشتغلتي محلي على ويندوز
 DEFAULT_TESS_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
 
@@ -100,7 +99,7 @@ def safe_name(s: str) -> str:
 
 
 def ensure_tesseract():
-    """تهيئة مسار Tesseract لو متوفر (يفيد على اللابتوب)."""
+    """تهيئة مسار Tesseract لو متوفر (محلي على ويندوز مثلاً)."""
     env_cmd = os.environ.get("TESSERACT_CMD", "").strip()
     if env_cmd and os.path.exists(env_cmd):
         pytesseract.pytesseract.tesseract_cmd = env_cmd
@@ -181,12 +180,18 @@ def classic_ocr_text(pil_img: Image.Image) -> str:
         return ""
 
 
-# إعدادات OpenRouter (تحطي OPENROUTER_API_KEY كسِر في Streamlit)
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY") or ""
+# إعدادات OpenRouter (تأكدي إن OPENROUTER_API_KEY موجودة في secrets أو env)
 OPENROUTER_MODEL = "google/gemini-2.5-flash"
 OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_SITE = "https://dk7htkk4qh6yhfjzv6.streamlit.app"
 OPENROUTER_APP_NAME = "Audit Nameplate App"
+
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+try:
+    if not OPENROUTER_API_KEY:
+        OPENROUTER_API_KEY = st.secrets["OPENROUTER_API_KEY"]  # إذا حطّيتيها في secrets
+except Exception:
+    pass
 
 
 def _empty_fields():
@@ -204,10 +209,10 @@ def ai_extract_fields(pil_img: Image.Image) -> tuple[str, dict]:
     """
     استخدام Gemini عبر OpenRouter لاستخراج الحقول من صورة الـ Nameplate.
     يرجّع:
-      - raw_text: نص كامل (اللي رجعه الموديل)
+      - raw_text: النص اللي رجعه الموديل
       - fields: dict فيه Model / Serial / Voltage_V / Current_A / Power_kW / Frequency_Hz
     """
-    api_key = OPENROUTER_API_KEY or os.environ.get("OPENROUTER_API_KEY")
+    api_key = OPENROUTER_API_KEY
     if not api_key:
         return "", _empty_fields()
 
@@ -277,7 +282,7 @@ Return ONLY valid JSON.
 
         content = data["choices"][0]["message"]["content"]
 
-        # OpenRouter أحياناً يرجع قائمة أجزاء
+        # ممكن يرجّع قائمة أجزاء
         if isinstance(content, list):
             text_parts = []
             for part in content:
@@ -297,7 +302,7 @@ Return ONLY valid JSON.
         try:
             parsed = json.loads(json_text)
         except Exception:
-            # لو فشل الـ JSON، نخزن النص الخام فقط
+            # لو JSON خربان، نرجع النص بس بدون قيم
             return content, _empty_fields()
 
         fields = {
@@ -316,12 +321,7 @@ Return ONLY valid JSON.
 
 
 def analyze_nameplate(pil_img: Image.Image) -> tuple[str, dict]:
-    """
-    دالة موحّدة:
-      - تحاول Tesseract (لو موجود)
-      - تستعمل AI Vision عبر OpenRouter
-      - ترجع نص مشترك + الحقول المستخرجة (من AI)
-    """
+    """دمج Tesseract + Gemini (لو متوفر) في دالة واحدة."""
     classic = classic_ocr_text(pil_img)
     ai_raw, ai_fields = ai_extract_fields(pil_img)
 
@@ -335,7 +335,7 @@ def analyze_nameplate(pil_img: Image.Image) -> tuple[str, dict]:
 
 
 # =========================================================
-# 3) EXCEL EXPORT (مع الصور)
+# 3) EXCEL EXPORT (مع الصور + AreaName)
 # =========================================================
 
 def build_excel_report(df: pd.DataFrame, out_path: str):
@@ -461,7 +461,7 @@ def build_excel_report(df: pd.DataFrame, out_path: str):
                 except Exception:
                     pass
 
-            for c in range(1, len(cols)):  # آخر عمود للصورة ما بنعمله alignment
+            for c in range(1, len(cols)):  # آخر عمود للصورة فقط
                 ws.cell(row=r, column=c).alignment = center
 
     wb.save(out_path)
@@ -488,35 +488,30 @@ with col2:
 
 default_places = AUDIT_TEMPLATES.get(audit_type, [])
 
-# قائمة الأماكن القابلة للتعديل (بدون قيم جاهزة، بس Placeholder)
+# قائمة الأماكن القابلة للتعديل (ترجع زي زمان مع القيم الجاهزة)
 st.divider()
 st.subheader("Audit Components (editable list)")
-
-placeholder_text = (
-    "Example:\n" + "\n".join(default_places)
-    if default_places
-    else "Lobby\nKitchen\nBoiler Room"
-)
-
 places_text = st.text_area(
-    "Custom / additional places for this facility (one per line)",
-    value="",
-    placeholder=placeholder_text,
+    "One place per line",
+    value="\n".join(default_places),
     height=180,
 )
-
-# المستخدم هو اللي يكتب كل الأماكن
 places = [p.strip() for p in places_text.splitlines() if p.strip()]
 
 if not places:
     st.warning("Please add at least one place (one per line).")
 
-# اختيار المكان + اسم المنطقة الفرعي
+# اختيار المكان + عدد التكرارات + اسم المنطقة الاختياري
 st.divider()
 st.subheader("Choose a place to capture nameplates")
 
-place = st.selectbox("Place (from your list)", places) if places else None
-count = 1  # دايمًا واحد – ما في عدد تكرارات
+place = st.selectbox("Place", places) if places else None
+count = st.number_input(
+    "How many instances of this place?",
+    min_value=1,
+    max_value=20,
+    value=1,
+)
 
 custom_area = ""
 if facility_name and place:
@@ -526,34 +521,30 @@ if facility_name and place:
         key=f"area_{facility_name or 'fac'}_{place or 'place'}",
     )
 
-    place_label = (
-        f"{place} – {custom_area.strip()}" if custom_area.strip() else place
-    )
+    place_label = f"{place} – {custom_area.strip()}" if custom_area.strip() else place
 
     st.info(
         f"You will capture nameplates for: "
-        f"**{facility_name} → {place_label}**"
+        f"**{facility_name} → {place_label} (1..{int(count)})**"
     )
 
 st.divider()
 st.subheader("Capture nameplates")
 
 if facility_name and place:
-    place_label = (
-        f"{place} – {custom_area.strip()}" if custom_area.strip() else place
-    )
+    place_label = f"{place} – {custom_area.strip()}" if custom_area.strip() else place
 
-    for i in range(1, count + 1):  # دايمًا 1
-        with st.expander(f"{place_label} #{i}", expanded=True):
+    for i in range(1, int(count) + 1):
+        with st.expander(f"{place_label} #{i}", expanded=(i == 1)):
             # تصوير مباشر من الكاميرا (مهم للموبايل)
             camera_photo = st.camera_input(
-                f"Take photo for {place_label}",
+                f"Take photo for {place_label} #{i}",
                 key=f"cam_{audit_type}_{place}_{i}",
             )
 
             # أو رفع صورة موجودة
             uploaded = st.file_uploader(
-                f"Or upload existing image for {place_label}",
+                f"Or upload existing image for {place_label} #{i}",
                 type=["png", "jpg", "jpeg", "webp", "heic", "heif"],
                 key=f"upl_{audit_type}_{place}_{i}",
             )
@@ -624,7 +615,7 @@ if facility_name and place:
 
                 # زر الحفظ
                 if st.button(
-                    f"Save record for {place_label}",
+                    f"Save record for {place_label} #{i}",
                     key=f"save_{place}_{i}",
                 ):
                     safe_fac = safe_name(facility_name)
@@ -646,8 +637,8 @@ if facility_name and place:
                         "Timestamp": datetime.now().isoformat(timespec="seconds"),
                         "AuditType": audit_type,
                         "Facility": facility_name,
-                        "Place": place,
-                        "AreaName": custom_area.strip(),
+                        "Place": place,                       # المكان الأساسي
+                        "AreaName": custom_area.strip(),      # اسم المنطقة الإضافي
                         "PlaceIndex": i,
                         "Model": model,
                         "Serial": serial,
@@ -677,6 +668,7 @@ st.subheader("Current CSV preview")
 if os.path.exists(CSV_PATH):
     df_all = pd.read_csv(CSV_PATH)
 
+    # نعرض فقط السجلات لنفس الـ Facility اللي شغّالة عليها
     if facility_name:
         df_preview = df_all[df_all["Facility"] == facility_name].copy()
     else:
