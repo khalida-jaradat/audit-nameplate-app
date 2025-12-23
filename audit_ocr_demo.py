@@ -30,18 +30,18 @@ AUDIT_TEMPLATES = {
         "Rooms",
         "Kitchen",
         "Pool",
-        "Boiler Room",
-        "Electrical Room",
-        "Generator Room",
+        "Boiler system",
+        "Electrical system",
+        "Generator system",
         "Laundry",
     ],
     "Factories": [
-        "Production Line",
+        "Production Lines",
         "Workshop / Maintenance",
         "Warehouse",
-        "Compressor Room",
-        "Boiler Room",
-        "Electrical Room",
+        "Compressor system",
+        "Boiler system",
+        "Electrical system",
         "Generator Room",
         "Office Area",
         "Outdoor / Yard",
@@ -49,7 +49,8 @@ AUDIT_TEMPLATES = {
         "Chilled Water Network",
         "Compressed Air Network",
         "Hot Water Network",
-        "Steam Network & Steam Generator",
+        "Steam Network ",
+        " Steam Generator",
     ],
     "Schools": [
         "Classrooms",
@@ -59,8 +60,8 @@ AUDIT_TEMPLATES = {
         "Library",
         "Cafeteria",
         "Sports Hall / Outdoor Area",
-        "Electrical Room",
-        "Generator Room",
+        "Electrical system",
+        "Generator system",
     ],
     "Hospitals": [
         "ER",
@@ -72,9 +73,9 @@ AUDIT_TEMPLATES = {
         "Pharmacy",
         "Kitchen",
         "Laundry",
-        "Boiler Room",
-        "Electrical Room",
-        "Generator Room",
+        "Boiler system",
+        "Electrical system",
+        "Generator system",
     ],
 }
 
@@ -723,4 +724,5 @@ if os.path.exists(CSV_PATH):
         st.info("No records for this facility yet. Save at least one nameplate record.")
 else:
     st.info("No CSV records yet. Save at least one nameplate record first.")
+
 
