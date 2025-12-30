@@ -457,15 +457,15 @@ def build_excel_report(df: pd.DataFrame, out_path: str):
 st.set_page_config(page_title="Mahatta Energy Audit Data System", layout="wide")
 st.title("Mahatta Energy Audit Data System")
 st.sidebar.header("System Status")
+st.sidebar.header("System Status")
+st.sidebar.write("Model:", OPENROUTER_MODEL)
+
 if OPENROUTER_API_KEY:
     st.sidebar.success("AI Vision: ENABLED ✅")
+    st.sidebar.write("Key length:", len(OPENROUTER_API_KEY))
 else:
     st.sidebar.error("AI Vision: DISABLED ❌ (OPENROUTER_API_KEY missing)")
 
-st.write(
-    "Proof-of-concept for your audit flow: "
-    "select audit type → facility → area → capture or upload nameplate → OCR / AI assist → auto log → export Excel."
-)
 
 # اختيار نوع الأوديت والمنشأة
 col1, col2 = st.columns(2)
@@ -711,6 +711,7 @@ if os.path.exists(CSV_PATH):
         st.info("No records for this facility yet. Save at least one nameplate record.")
 else:
     st.info("No CSV records yet. Save at least one nameplate record first.")
+
 
 
 
