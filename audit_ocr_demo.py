@@ -550,6 +550,8 @@ if facility_name and place:
                 # تحليل الصورة
                 with st.spinner("Analyzing image (OCR + AI)..."):
                     raw, fields = analyze_nameplate(pil_img)
+                    st.caption("Debug (AI/OCR Raw Output)")
+                    st.code(raw[:4000] if raw else "EMPTY RAW")
 
                 # الحقول القابلة للتعديل
                 st.markdown("### Extracted fields (edit if needed)")
@@ -711,6 +713,7 @@ if os.path.exists(CSV_PATH):
         st.info("No records for this facility yet. Save at least one nameplate record.")
 else:
     st.info("No CSV records yet. Save at least one nameplate record first.")
+
 
 
 
