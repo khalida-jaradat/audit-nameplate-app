@@ -207,44 +207,23 @@ def _empty_fields():
 
 
 def ai_extract_fields(pil_img: Image.Image) -> tuple[str, dict]:
-    """
-    استخدام Gemini عبر OpenRouter لاستخراج الحقول من صورة الـ Nameplate.
-    يرجّع:
-      - raw_text: النص اللي رجعه الموديل
-      - fields: dict فيه Model / Serial / Voltage_V / Current_A / Power_kW / Frequency_Hz
-    """
     api_key = OPENROUTER_API_KEY
     if not api_key:
-        return "", _empty_fields()
+        return "AI ERROR: OPENROUTER_API_KEY is missing", _empty_fields()
 
     try:
-        # تحويل الصورة لـ base64
+        # مهم: توحيد صيغة الصورة (خصوصًا للموبايل)
+        pil_img2 = pil_img.convert("RGB")
+
         buf = io.BytesIO()
-        pil_img.save(buf, format="JPEG")
+        pil_img2.save(buf, format="JPEG", quality=90)
         b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
 
         prompt = """
-You are an electrical audit expert.
-You get ONE nameplate image of an electrical / mechanical device.
-
-Extract ONLY these fields and return STRICT JSON (no extra text):
-
-{
-  "model": "...",
-  "serial": "...",
-  "voltage_v": 230,
-  "current_a": 2.0,
-  "power_kw": 0.4,
-  "frequency_hz": 50
-}
-
-Rules:
-- voltage_v: main supply voltage in volts (if '220-240V', return 230).
-- current_a: rated current in amperes (A).
-- power_kw: rated power in kilowatts. If only W is written, convert to kW with 3 decimals.
-- frequency_hz: frequency in Hz (normally 50 or 60).
-- If any field is missing on the label, return null for that field.
-Return ONLY valid JSON.
+Return STRICT JSON only (no text).
+Keys must be exactly:
+model, serial, voltage_v, current_a, power_kw, frequency_hz
+If missing -> null
 """
 
         headers = {
@@ -262,12 +241,7 @@ Return ONLY valid JSON.
                     "role": "user",
                     "content": [
                         {"type": "text", "text": prompt},
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{b64}"
-                            },
-                        },
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
                     ],
                 }
             ],
@@ -275,15 +249,16 @@ Return ONLY valid JSON.
             "max_tokens": 300,
         }
 
-        resp = requests.post(
-            OPENROUTER_ENDPOINT, headers=headers, json=payload, timeout=40
-        )
-        resp.raise_for_status()
-        data = resp.json()
+        resp = requests.post(OPENROUTER_ENDPOINT, headers=headers, json=payload, timeout=60)
 
+        # ✅ هون أهم سطر: إذا في مشكلة، اعرضيها للمستخدم بدل ما تختفي
+        if resp.status_code != 200:
+            err_txt = resp.text[:2000]
+            return f"AI HTTP {resp.status_code}: {err_txt}", _empty_fields()
+
+        data = resp.json()
         content = data["choices"][0]["message"]["content"]
 
-        # ممكن يرجّع قائمة أجزاء
         if isinstance(content, list):
             text_parts = []
             for part in content:
@@ -295,6 +270,7 @@ Return ONLY valid JSON.
         elif not isinstance(content, str):
             content = str(content)
 
+        # حاول نستخرج JSON
         json_text = content
         m = re.search(r"\{.*\}", content, re.DOTALL)
         if m:
@@ -303,22 +279,28 @@ Return ONLY valid JSON.
         try:
             parsed = json.loads(json_text)
         except Exception:
-            # لو JSON خربان، نرجع النص بس بدون قيم
-            return content, _empty_fields()
+            # رجّعي الرد كامل عشان تشوفي شو رجّع بالضبط
+            return f"AI PARSE ERROR. Raw:\n{content[:2000]}", _empty_fields()
+
+        # ✅ normalize keys (أحيانًا بيرجع Model بدل model)
+        parsed_l = {str(k).strip().lower(): v for k, v in parsed.items()}
+
+        def pick(k):
+            v = parsed_l.get(k, None)
+            return "" if v is None else str(v)
 
         fields = {
-            "Model": str(parsed.get("model") or ""),
-            "Serial": str(parsed.get("serial") or ""),
-            "Voltage_V": str(parsed.get("voltage_v") or ""),
-            "Current_A": str(parsed.get("current_a") or ""),
-            "Power_kW": str(parsed.get("power_kw") or ""),
-            "Frequency_Hz": str(parsed.get("frequency_hz") or ""),
+            "Model": pick("model"),
+            "Serial": pick("serial"),
+            "Voltage_V": pick("voltage_v"),
+            "Current_A": pick("current_a"),
+            "Power_kW": pick("power_kw"),
+            "Frequency_Hz": pick("frequency_hz"),
         }
-        return content, fields
+        return json_text, fields
 
     except Exception as e:
-        print("AI vision error:", e)
-        return "", _empty_fields()
+        return f"AI EXCEPTION: {repr(e)}", _empty_fields()
 
 
 def analyze_nameplate(pil_img: Image.Image) -> tuple[str, dict]:
@@ -729,6 +711,7 @@ if os.path.exists(CSV_PATH):
         st.info("No records for this facility yet. Save at least one nameplate record.")
 else:
     st.info("No CSV records yet. Save at least one nameplate record first.")
+
 
 
 
