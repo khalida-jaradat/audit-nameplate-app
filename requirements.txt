@@ -7,5 +7,7 @@ openpyxl
 google-generativeai
 numpy
 openai
+pillow-heif
+
 
 
