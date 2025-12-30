@@ -474,6 +474,11 @@ def build_excel_report(df: pd.DataFrame, out_path: str):
 
 st.set_page_config(page_title="Mahatta Energy Audit Data System", layout="wide")
 st.title("Mahatta Energy Audit Data System")
+st.sidebar.header("System Status")
+if OPENROUTER_API_KEY:
+    st.sidebar.success("AI Vision: ENABLED ✅")
+else:
+    st.sidebar.error("AI Vision: DISABLED ❌ (OPENROUTER_API_KEY missing)")
 
 st.write(
     "Proof-of-concept for your audit flow: "
@@ -724,5 +729,6 @@ if os.path.exists(CSV_PATH):
         st.info("No records for this facility yet. Save at least one nameplate record.")
 else:
     st.info("No CSV records yet. Save at least one nameplate record first.")
+
 
 
