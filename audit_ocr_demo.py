@@ -3,28 +3,23 @@ import re
 import io
 import json
 import base64
-import time
 from datetime import datetime
 
 import streamlit as st
 import pandas as pd
 from PIL import Image
 
+# Optional OCR libs (won't break if Tesseract missing)
 import cv2
 import numpy as np
-
-# pytesseract اختياري (لو موجود + Tesseract متثبت)
-try:
-    import pytesseract
-except Exception:
-    pytesseract = None
-
-import requests
+import pytesseract
 
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image as XLImage
 from openpyxl.utils import get_column_letter
 from openpyxl.styles import Font, Alignment, PatternFill
+
+from openai import OpenAI
 
 
 # =========================================================
@@ -95,6 +90,9 @@ os.makedirs(THUMBS_DIR, exist_ok=True)
 
 DEFAULT_TESS_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
+# Choose a vision-capable model
+OPENAI_VISION_MODEL = "gpt-4o-mini"
+
 
 # =========================================================
 # 1) HELPERS
@@ -106,107 +104,7 @@ def safe_name(s: str) -> str:
     return s.replace(" ", "_") if s else "AUDIT"
 
 
-def get_gemini_key_and_model():
-    key = None
-    model = None
-
-    # 1) env
-    key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-    model = os.environ.get("GEMINI_MODEL")
-
-    # 2) streamlit secrets
-    try:
-        if not key:
-            key = st.secrets.get("GEMINI_API_KEY", None)
-        if not model:
-            model = st.secrets.get("GEMINI_MODEL", None)
-    except Exception:
-        pass
-
-    if not model:
-        model = "gemini-2.5-flash"
-
-    return key, model
-
-
-def append_record(row: dict):
-    if os.path.exists(CSV_PATH):
-        df = pd.read_csv(CSV_PATH)
-        df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
-    else:
-        df = pd.DataFrame([row])
-
-    df.to_csv(CSV_PATH, index=False)
-
-
-def create_thumbnail(img_path: str):
-    try:
-        if not img_path or not os.path.exists(img_path):
-            return None
-
-        base = os.path.basename(img_path)
-        name, _ = os.path.splitext(base)
-        thumb_path = os.path.join(THUMBS_DIR, f"{name}_thumb.png")
-
-        pil = Image.open(img_path)
-        pil = pil.convert("RGB")
-        pil.thumbnail((260, 160))
-        pil.save(thumb_path, format="PNG")
-        return thumb_path
-    except Exception:
-        return None
-
-
-def try_enable_heic():
-    """
-    لو بدك HEIC/HEIF يشتغل: pip install pillow-heif
-    """
-    try:
-        import pillow_heif
-        pillow_heif.register_heif_opener()
-        return True
-    except Exception:
-        return False
-
-
-HEIC_ENABLED = try_enable_heic()
-
-
-def load_pil_image(file_obj) -> Image.Image:
-    """
-    تحميل صورة من camera_input أو file_uploader بشكل robust
-    """
-    if hasattr(file_obj, "getvalue"):
-        data = file_obj.getvalue()
-    else:
-        data = file_obj.read()
-
-    bio = io.BytesIO(data)
-    img = Image.open(bio)
-    return img
-
-
-def resize_for_ai(pil_img: Image.Image, max_side: int = 1600) -> Image.Image:
-    """
-    تصغير الصورة لتقليل الاستهلاك وتحسين السرعة، بدون ما نخرب القراءة
-    """
-    img = pil_img.convert("RGB")
-    w, h = img.size
-    m = max(w, h)
-    if m <= max_side:
-        return img
-    scale = max_side / float(m)
-    nw, nh = int(w * scale), int(h * scale)
-    return img.resize((nw, nh), Image.LANCZOS)
-
-
-# =========================================================
-# 2) OCR (اختياري) + Gemini Vision
-# =========================================================
-
 def ensure_tesseract():
-    if pytesseract is None:
-        return
     env_cmd = os.environ.get("TESSERACT_CMD", "").strip()
     if env_cmd and os.path.exists(env_cmd):
         pytesseract.pytesseract.tesseract_cmd = env_cmd
@@ -215,6 +113,61 @@ def ensure_tesseract():
         pytesseract.pytesseract.tesseract_cmd = DEFAULT_TESS_CMD
 
 
+def append_record(row: dict):
+    if os.path.exists(CSV_PATH):
+        df = pd.read_csv(CSV_PATH)
+        df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+    else:
+        df = pd.DataFrame([row])
+    df.to_csv(CSV_PATH, index=False)
+
+
+def create_thumbnail(img_path: str) -> str | None:
+    try:
+        if not img_path or not os.path.exists(img_path):
+            return None
+        base = os.path.basename(img_path)
+        name, _ = os.path.splitext(base)
+        thumb_path = os.path.join(THUMBS_DIR, f"{name}_thumb.png")
+
+        pil = Image.open(img_path).convert("RGB")
+        pil.thumbnail((260, 160))
+        pil.save(thumb_path, format="PNG")
+        return thumb_path
+    except Exception:
+        return None
+
+
+def extract_json_object(text: str) -> dict:
+    """
+    Robust JSON extraction:
+    - finds the first {...} block and tries json.loads
+    """
+    if not text:
+        return {}
+    # Try direct
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    # Find first JSON object-like substring
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        sub = text[start:end + 1]
+        try:
+            return json.loads(sub)
+        except Exception:
+            return {}
+
+    return {}
+
+
+# =========================================================
+# 2) OCR + AI VISION
+# =========================================================
+
 def preprocess_for_ocr(pil_img: Image.Image) -> np.ndarray:
     img = np.array(pil_img.convert("RGB"))
     img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
@@ -222,230 +175,129 @@ def preprocess_for_ocr(pil_img: Image.Image) -> np.ndarray:
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     gray = cv2.bilateralFilter(gray, 9, 75, 75)
     th = cv2.adaptiveThreshold(
-        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 10
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY, 31, 10
     )
     return th
 
 
 def classic_ocr_text(pil_img: Image.Image) -> str:
-    if pytesseract is None:
-        return ""
     try:
         ensure_tesseract()
         proc = preprocess_for_ocr(pil_img)
-        text = pytesseract.image_to_string(proc, config="--oem 3 --psm 6", lang="eng")
-        return text or ""
+        return pytesseract.image_to_string(proc, config="--oem 3 --psm 6", lang="eng") or ""
     except Exception:
         return ""
 
 
-def parse_number(value):
-    if value is None:
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    s = str(value)
-    s = s.replace(",", ".")
-    m = re.search(r"[-+]?\d+(\.\d+)?", s)
-    if not m:
-        return None
+def get_openai_client() -> OpenAI | None:
+    api_key = None
     try:
-        return float(m.group(0))
+        api_key = st.secrets.get("OPENAI_API_KEY", None)  # Streamlit Cloud secrets
     except Exception:
+        api_key = None
+
+    if not api_key:
+        api_key = os.environ.get("OPENAI_API_KEY")
+
+    if not api_key:
         return None
 
+    return OpenAI(api_key=api_key)
 
-def normalize_fields(data: dict) -> dict:
+
+def ai_extract_fields_openai(pil_img: Image.Image) -> tuple[str, dict, str]:
     """
-    تنظيف وتحويل القيم للعرض
+    Returns: (raw_text, fields_dict, error_msg)
+    fields_dict keys: Model, Serial, Voltage_V, Current_A, Power_kW, Frequency_Hz
     """
-    model = (data.get("model") or data.get("Model") or "").strip()
-    serial = (data.get("serial") or data.get("Serial") or "").strip()
-
-    voltage = data.get("voltage_v") if "voltage_v" in data else data.get("Voltage_V")
-    current = data.get("current_a") if "current_a" in data else data.get("Current_A")
-    power = data.get("power_kw") if "power_kw" in data else data.get("Power_kW")
-    freq = data.get("frequency_hz") if "frequency_hz" in data else data.get("Frequency_Hz")
-
-    v = parse_number(voltage)
-    a = parse_number(current)
-    kw = parse_number(power)
-    hz = parse_number(freq)
-
-    # لو الجهد جاينا كنص "220-240" نخليها 230
-    if isinstance(voltage, str) and "-" in voltage:
-        parts = re.findall(r"\d+(\.\d+)?", voltage)
-        if len(parts) >= 2:
-            try:
-                v1 = float(parts[0]); v2 = float(parts[1])
-                v = (v1 + v2) / 2.0
-            except Exception:
-                pass
-
-    # لو الاستطاعة جاية بالواط داخل نص
-    if kw is None and isinstance(power, str):
-        m = re.search(r"(\d+(\.\d+)?)\s*W", power, re.IGNORECASE)
-        if m:
-            try:
-                kw = float(m.group(1)) / 1000.0
-            except Exception:
-                pass
-
-    return {
-        "Model": model,
-        "Serial": serial,
-        "Voltage_V": "" if v is None else str(int(v)) if abs(v - int(v)) < 1e-6 else str(round(v, 2)),
-        "Current_A": "" if a is None else str(round(a, 3)),
-        "Power_kW": "" if kw is None else str(round(kw, 3)),
-        "Frequency_Hz": "" if hz is None else str(int(hz)) if abs(hz - int(hz)) < 1e-6 else str(round(hz, 2)),
-    }
-
-
-def gemini_extract_fields(pil_img: Image.Image, max_output_tokens: int = 180) -> tuple[str, dict, str]:
-    """
-    Gemini Vision عبر REST
-    returns: (raw_text, fields, err)
-    """
-    api_key, model = get_gemini_key_and_model()
-    if not api_key:
+    client = get_openai_client()
+    if client is None:
         return "", {
-            "Model": "", "Serial": "", "Voltage_V": "", "Current_A": "", "Power_kW": "", "Frequency_Hz": ""
-        }, "No GEMINI_API_KEY found in secrets/env."
+            "Model": "", "Serial": "", "Voltage_V": "",
+            "Current_A": "", "Power_kW": "", "Frequency_Hz": ""
+        }, "OPENAI_API_KEY is missing in Streamlit Secrets."
 
-    img = resize_for_ai(pil_img, max_side=1600)
+    try:
+        # encode image as base64
+        buf = io.BytesIO()
+        pil_img.convert("RGB").save(buf, format="JPEG", quality=90)
+        b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
 
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=88)
-    b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+        prompt = (
+            "You are an electrical audit assistant. Read this single equipment nameplate image "
+            "and extract ONLY these fields as JSON:\n"
+            "{\n"
+            '  "model": string|null,\n'
+            '  "serial": string|null,\n'
+            '  "voltage_v": number|null,\n'
+            '  "current_a": number|null,\n'
+            '  "power_kw": number|null,\n'
+            '  "frequency_hz": number|null\n'
+            "}\n\n"
+            "Rules:\n"
+            "- Return JSON ONLY (no markdown, no explanation).\n"
+            "- Keep serial exactly as written.\n"
+            "- If voltage is a range like 220-240V, return the mid value (e.g., 230).\n"
+            "- If power is in W, convert to kW (e.g., 2400 W -> 2.4).\n"
+            "- If a field is not present, use null.\n"
+        )
 
-    prompt = (
-        "You are an electrical audit expert. Read ONE equipment nameplate image and extract ONLY these fields.\n"
-        "Return STRICT JSON only (no markdown, no extra text):\n"
-        "{\n"
-        '  "model": string | null,\n'
-        '  "serial": string | null,\n'
-        '  "voltage_v": number | null,\n'
-        '  "current_a": number | null,\n'
-        '  "power_kw": number | null,\n'
-        '  "frequency_hz": number | null\n'
-        "}\n"
-        "Rules:\n"
-        "- If voltage is a range like 220-240V, return 230.\n"
-        "- If power is in W, convert to kW.\n"
-        "- If a field is missing, return null.\n"
-    )
-
-    schema = {
-        "type": "object",
-        "properties": {
-            "model": {"type": ["string", "null"]},
-            "serial": {"type": ["string", "null"]},
-            "voltage_v": {"type": ["number", "null"]},
-            "current_a": {"type": ["number", "null"]},
-            "power_kw": {"type": ["number", "null"]},
-            "frequency_hz": {"type": ["number", "null"]},
-        },
-        "required": ["model", "serial", "voltage_v", "current_a", "power_kw", "frequency_hz"],
-    }
-
-    payload = {
-        "contents": [{
-            "role": "user",
-            "parts": [
-                {"text": prompt},
+        resp = client.responses.create(
+            model=OPENAI_VISION_MODEL,
+            input=[
                 {
-                    "inlineData": {
-                        "mimeType": "image/jpeg",
-                        "data": b64
-                    },
-                    "mediaResolution": {"level": "media_resolution_high"},
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": prompt},
+                        {"type": "input_image", "image_url": f"data:image/jpeg;base64,{b64}"},
+                    ],
                 }
-            ]
-        }],
-        "generationConfig": {
-            "temperature": 0,
-            "maxOutputTokens": int(max_output_tokens),
-            "responseMimeType": "application/json",
-            "responseJsonSchema": schema,
-        },
-    }
+            ],
+            max_output_tokens=180,
+        )
 
-    headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
+        raw_text = getattr(resp, "output_text", "") or ""
+        data = extract_json_object(raw_text)
 
-    def call(version: str):
-        url = f"https://generativelanguage.googleapis.com/{version}/models/{model}:generateContent"
-        return requests.post(url, headers=headers, data=json.dumps(payload), timeout=60)
+        fields = {
+            "Model": (data.get("model") if isinstance(data, dict) else "") or "",
+            "Serial": (data.get("serial") if isinstance(data, dict) else "") or "",
+            "Voltage_V": "" if not isinstance(data, dict) else ("" if data.get("voltage_v") is None else str(data.get("voltage_v"))),
+            "Current_A": "" if not isinstance(data, dict) else ("" if data.get("current_a") is None else str(data.get("current_a"))),
+            "Power_kW": "" if not isinstance(data, dict) else ("" if data.get("power_kw") is None else str(data.get("power_kw"))),
+            "Frequency_Hz": "" if not isinstance(data, dict) else ("" if data.get("frequency_hz") is None else str(data.get("frequency_hz"))),
+        }
 
-    # retry بسيط ل 429
-    for attempt in range(3):
-        resp = call("v1beta")
-        if resp.status_code == 404:
-            resp = call("v1alpha")
+        return raw_text, fields, ""
 
-        if resp.status_code == 429:
-            try:
-                time.sleep(2 + attempt)
-            except Exception:
-                pass
-            continue
-
-        if resp.status_code != 200:
-            return "", {
-                "Model": "", "Serial": "", "Voltage_V": "", "Current_A": "", "Power_kW": "", "Frequency_Hz": ""
-            }, f"Gemini HTTP {resp.status_code}: {resp.text[:800]}"
-
-        try:
-            rj = resp.json()
-            parts = rj["candidates"][0]["content"]["parts"]
-            raw_text = "\n".join([p.get("text", "") for p in parts if isinstance(p, dict)])
-
-            # raw_text المفروض JSON
-            try:
-                data = json.loads(raw_text)
-            except Exception:
-                # حاول نقتص JSON من داخل النص
-                s = raw_text
-                i1 = s.find("{"); i2 = s.rfind("}")
-                if i1 != -1 and i2 != -1 and i2 > i1:
-                    data = json.loads(s[i1:i2+1])
-                else:
-                    data = {}
-
-            fields = normalize_fields(data if isinstance(data, dict) else {})
-            return raw_text, fields, ""
-        except Exception as e:
-            return "", {
-                "Model": "", "Serial": "", "Voltage_V": "", "Current_A": "", "Power_kW": "", "Frequency_Hz": ""
-            }, f"Parse error: {e}"
-
-    return "", {
-        "Model": "", "Serial": "", "Voltage_V": "", "Current_A": "", "Power_kW": "", "Frequency_Hz": ""
-    }, "Rate limited (429). Try again."
+    except Exception as e:
+        return "", {
+            "Model": "", "Serial": "", "Voltage_V": "",
+            "Current_A": "", "Power_kW": "", "Frequency_Hz": ""
+        }, f"{e}"
 
 
-def analyze_nameplate(pil_img: Image.Image, max_output_tokens: int = 180) -> tuple[str, dict, str]:
+def analyze_nameplate(pil_img: Image.Image) -> tuple[str, dict, str]:
     """
-    Unified:
-    - Gemini Vision أولاً
-    - OCR اختياري كـ fallback
+    AI first. OCR is only for debugging (optional).
+    Returns: (raw_combined, fields, error_msg)
     """
-    ai_raw, ai_fields, ai_err = gemini_extract_fields(pil_img, max_output_tokens=max_output_tokens)
+    ai_raw, ai_fields, err = ai_extract_fields_openai(pil_img)
 
-    classic = ""
-    if not any(ai_fields.values()):
-        classic = classic_ocr_text(pil_img)
+    classic = classic_ocr_text(pil_img)  # may be empty on Streamlit Cloud
 
     raw_combined = ""
-    if classic:
-        raw_combined += classic + "\n\n---\n\n"
     if ai_raw:
         raw_combined += ai_raw
+    if classic:
+        raw_combined += "\n\n---\n\n" + classic
 
-    return raw_combined, ai_fields, ai_err
+    return raw_combined, ai_fields, err
 
 
 # =========================================================
-# 3) EXCEL EXPORT (مع الصور)
+# 3) EXCEL EXPORT
 # =========================================================
 
 def build_excel_report(df: pd.DataFrame, out_path: str):
@@ -469,7 +321,11 @@ def build_excel_report(df: pd.DataFrame, out_path: str):
     center = Alignment(vertical="center", wrap_text=True)
 
     def set_col_widths(ws):
-        widths = {1: 10, 2: 22, 3: 10, 4: 22, 5: 22, 6: 12, 7: 12, 8: 12, 9: 14, 10: 22, 11: 22, 12: 30}
+        widths = {
+            1: 10, 2: 22, 3: 10, 4: 20, 5: 22,
+            6: 12, 7: 12, 8: 12, 9: 14,
+            10: 22, 11: 22, 12: 30,
+        }
         for col_idx, w in widths.items():
             ws.column_dimensions[get_column_letter(col_idx)].width = w
 
@@ -504,20 +360,22 @@ def build_excel_report(df: pd.DataFrame, out_path: str):
             record_id = f"{rec_counter:03d}"
             rec_counter += 1
 
-            ws.append([
-                record_id,
-                place,
-                row.get("PlaceIndex", ""),
-                row.get("Model", ""),
-                row.get("Serial", ""),
-                row.get("Voltage_V", ""),
-                row.get("Current_A", ""),
-                row.get("Power_kW", ""),
-                row.get("Frequency_Hz", ""),
-                row.get("Timestamp", ""),
-                row.get("Notes", ""),
-                "",
-            ])
+            ws.append(
+                [
+                    record_id,
+                    row.get("Place", ""),
+                    row.get("PlaceIndex", ""),
+                    row.get("Model", ""),
+                    row.get("Serial", ""),
+                    row.get("Voltage_V", ""),
+                    row.get("Current_A", ""),
+                    row.get("Power_kW", ""),
+                    row.get("Frequency_Hz", ""),
+                    row.get("Timestamp", ""),
+                    row.get("Notes", ""),
+                    "",
+                ]
+            )
 
             r = ws.max_row
             ws.row_dimensions[r].height = 120
@@ -545,26 +403,29 @@ def build_excel_report(df: pd.DataFrame, out_path: str):
 # 4) STREAMLIT UI
 # =========================================================
 
-st.set_page_config(page_title="Audit Nameplate OCR - Demo", layout="wide")
-st.title("Audit Nameplate OCR - Quick Demo")
+st.set_page_config(page_title="Audit Nameplate (AI Vision)", layout="wide")
+st.title("Audit Nameplate - AI Vision (OpenAI)")
 
-api_key, model_name = get_gemini_key_and_model()
-
+# ---- Status box
 with st.sidebar:
-    st.header("System Status")
-    st.write(f"Model: `{model_name}`")
-    st.success("AI Vision: ENABLED ✅" if api_key else "AI Vision: DISABLED ❌")
-    st.write(f"Key length: {len(api_key) if api_key else 0}")
-    st.caption(f"HEIC enabled: {HEIC_ENABLED}")
+    st.subheader("System Status")
+    key_ok = False
+    try:
+        key_ok = bool(st.secrets.get("OPENAI_API_KEY", ""))
+    except Exception:
+        key_ok = bool(os.environ.get("OPENAI_API_KEY", ""))
 
-    max_tokens = st.slider("AI max output tokens", 80, 260, 180, 10)
-    st.caption("Lower tokens = أقل تكلفة/استهلاك + أقل أخطاء quotas.")
-
+    st.write(f"Model: `{OPENAI_VISION_MODEL}`")
+    st.write(f"AI Vision: {'ENABLED ✅' if key_ok else 'DISABLED ❌'}")
+    if key_ok:
+        k = (st.secrets.get("OPENAI_API_KEY", "") if hasattr(st, "secrets") else os.environ.get("OPENAI_API_KEY", ""))
+        st.write(f"Key length: {len(str(k))}")
 
 st.write(
-    "Select audit type → facility → area → capture nameplate → AI extracts values → save → export Excel."
+    "Select audit type → facility → place → capture/upload nameplate → AI extracts fields → save → export Excel."
 )
 
+# ---- Audit type + facility
 col1, col2 = st.columns(2)
 with col1:
     audit_type = st.selectbox("Audit Type", list(AUDIT_TEMPLATES.keys()))
@@ -583,16 +444,16 @@ places_text = st.text_area(
 places = [p.strip() for p in places_text.splitlines() if p.strip()]
 
 if not places:
-    st.warning("Please add at least one place to continue.")
+    st.warning("Please add at least one place (one per line).")
 
+# ---- Place + optional custom area + count
 st.divider()
 st.subheader("Choose a place to capture nameplates")
 
-place = st.selectbox("Place", places) if places else None
+place = st.selectbox("Place (from your list)", places) if places else None
 
-# Custom area name (اختياري) — وبنخليه ينحفظ جنب الـ Place ككلمة وحدة
 custom_area = st.text_input(
-    "Custom area name (optional) – e.g., Main Kitchen, West Lobby",
+    "Custom area name (optional) — e.g., Main Kitchen, West Lobby",
     value="",
 )
 
@@ -603,72 +464,66 @@ count = st.number_input(
     value=1,
 )
 
-place_full = None
-if place:
-    ca = custom_area.strip()
-    place_full = f"{place} - {ca}" if ca else place
+# Combine place label (this is what will be saved + shown in CSV/Excel)
+custom_area_clean = (custom_area or "").strip()
+place_label = f"{place} - {custom_area_clean}" if (place and custom_area_clean) else place
 
-if facility_name and place_full:
-    st.info(f"You will capture nameplates for: **{facility_name} → {place_full} (1..{int(count)})**")
+if facility_name and place_label:
+    st.info(f"You will capture nameplates for: **{facility_name} → {place_label} (1..{int(count)})**")
 
 st.divider()
 st.subheader("Capture nameplates")
 
-if facility_name and place_full:
+if facility_name and place_label:
     for i in range(1, int(count) + 1):
-        with st.expander(f"{place_full} #{i}", expanded=(i == 1)):
-
+        with st.expander(f"{place_label} #{i}", expanded=(i == 1)):
+            # Works great on phone
             camera_photo = st.camera_input(
-                f"Take photo for {place_full} #{i}",
-                key=f"cam_{audit_type}_{place_full}_{i}",
+                f"Take photo for {place_label} #{i}",
+                key=f"cam_{audit_type}_{place_label}_{i}",
             )
 
             uploaded = st.file_uploader(
-                f"Or upload existing image for {place_full} #{i}",
-                type=["png", "jpg", "jpeg", "webp", "heic", "heif"],
-                key=f"upl_{audit_type}_{place_full}_{i}",
+                f"Or upload existing image for {place_label} #{i}",
+                type=["png", "jpg", "jpeg", "webp"],
+                key=f"upl_{audit_type}_{place_label}_{i}",
             )
 
             image_file = camera_photo or uploaded
 
             if image_file:
-                try:
-                    pil_img = load_pil_image(image_file)
-                except Exception as e:
-                    st.error(f"Cannot open this image on server. Try JPG/PNG. Error: {e}")
-                    st.stop()
-
+                pil_img = Image.open(image_file)
                 st.image(pil_img, caption="Uploaded image", use_container_width=True)
 
-                with st.spinner("Analyzing image (AI)..."):
-                    raw, fields, ai_err = analyze_nameplate(pil_img, max_output_tokens=int(max_tokens))
+                with st.spinner("Analyzing image (AI Vision)..."):
+                    raw, fields, err = analyze_nameplate(pil_img)
 
-                if ai_err and not any(fields.values()):
-                    st.warning(ai_err)
+                if err:
+                    st.warning(f"AI error: {err}")
 
                 st.markdown("### Extracted fields (edit if needed)")
                 c1, c2, c3, c4, c5, c6 = st.columns(6)
                 with c1:
-                    model_val = st.text_input("Model", value=fields.get("Model") or "", key=f"model_{place_full}_{i}")
+                    model = st.text_input("Model", value=fields.get("Model", ""), key=f"model_{place_label}_{i}")
                 with c2:
-                    serial_val = st.text_input("Serial", value=fields.get("Serial") or "", key=f"serial_{place_full}_{i}")
+                    serial = st.text_input("Serial", value=fields.get("Serial", ""), key=f"serial_{place_label}_{i}")
                 with c3:
-                    voltage_val = st.text_input("Voltage (V)", value=fields.get("Voltage_V") or "", key=f"volt_{place_full}_{i}")
+                    voltage = st.text_input("Voltage (V)", value=fields.get("Voltage_V", ""), key=f"volt_{place_label}_{i}")
                 with c4:
-                    current_val = st.text_input("Current (A)", value=fields.get("Current_A") or "", key=f"curr_{place_full}_{i}")
+                    current = st.text_input("Current (A)", value=fields.get("Current_A", ""), key=f"curr_{place_label}_{i}")
                 with c5:
-                    power_val = st.text_input("Power (kW)", value=fields.get("Power_kW") or "", key=f"pwr_{place_full}_{i}")
+                    power = st.text_input("Power (kW)", value=fields.get("Power_kW", ""), key=f"pwr_{place_label}_{i}")
                 with c6:
-                    freq_val = st.text_input("Frequency (Hz)", value=fields.get("Frequency_Hz") or "", key=f"hz_{place_full}_{i}")
+                    freq = st.text_input("Frequency (Hz)", value=fields.get("Frequency_Hz", ""), key=f"hz_{place_label}_{i}")
 
-                notes = st.text_input("Notes (optional)", value="", key=f"notes_{place_full}_{i}")
+                notes = st.text_input("Notes (optional)", value="", key=f"notes_{place_label}_{i}")
 
-                with st.expander("Raw OCR / AI JSON"):
+                with st.expander("Raw OCR / AI output (debug)"):
                     st.code(raw[:3000] if raw else "")
 
-                if st.button(f"Save record for {place_full} #{i}", key=f"save_{place_full}_{i}"):
+                if st.button(f"Save record for {place_label} #{i}", key=f"save_{place_label}_{i}"):
                     safe_fac = safe_name(facility_name)
-                    safe_place = safe_name(place_full)
+                    safe_place = safe_name(place_label)
 
                     dir_path = os.path.join(OUTPUT_DIR, safe_fac, f"{safe_place}_{i}")
                     os.makedirs(dir_path, exist_ok=True)
@@ -682,26 +537,25 @@ if facility_name and place_full:
                         "Timestamp": datetime.now().isoformat(timespec="seconds"),
                         "AuditType": audit_type,
                         "Facility": facility_name,
-                        "Place": place_full,     # ✅ هون الدمج
+                        "Place": place_label,          # ✅ place + custom area as one field
                         "PlaceIndex": i,
-                        "Model": model_val,
-                        "Serial": serial_val,
-                        "Voltage_V": voltage_val,
-                        "Current_A": current_val,
-                        "Power_kW": power_val,
-                        "Frequency_Hz": freq_val,
+                        "Model": model,
+                        "Serial": serial,
+                        "Voltage_V": voltage,
+                        "Current_A": current,
+                        "Power_kW": power,
+                        "Frequency_Hz": freq,
                         "Notes": notes,
                         "ImagePath": img_path,
                         "RawOCR": raw,
                     }
-
                     append_record(row)
 
                     json_path = os.path.join(dir_path, f"record_{ts}.json")
                     with open(json_path, "w", encoding="utf-8") as f:
                         json.dump(row, f, ensure_ascii=False, indent=2)
 
-                    st.success("Saved! Record added to CSV with local image.")
+                    st.success("Saved! Record added to CSV + image saved.")
 
 
 # =========================================================
@@ -714,7 +568,7 @@ st.subheader("Current CSV preview")
 if os.path.exists(CSV_PATH):
     df_all = pd.read_csv(CSV_PATH)
 
-    # ✅ عرض فقط سجلات المنشأة الحالية لو مكتوب اسمها
+    # ✅ show only current facility if typed
     if facility_name:
         df_show = df_all[df_all["Facility"] == facility_name].copy()
     else:
@@ -743,7 +597,10 @@ if os.path.exists(CSV_PATH):
 
     if not df_use.empty:
         safe_fac = safe_name(facility_name or "AUDIT")
-        xlsx_path = os.path.join(OUTPUT_DIR, f"AUDIT_{safe_fac}_{datetime.now().strftime('%Y%m%d')}.xlsx")
+        xlsx_path = os.path.join(
+            OUTPUT_DIR,
+            f"AUDIT_{safe_fac}_{datetime.now().strftime('%Y%m%d')}.xlsx",
+        )
 
         if st.button("Generate Excel with embedded images"):
             for col in ["Notes", "RawOCR", "Current_A"]:
