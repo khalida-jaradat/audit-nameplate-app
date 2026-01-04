@@ -217,7 +217,13 @@ def extract_first_json(text: str) -> str:
     return ""
 
 
-def gemini_extract_fields(pil_img: Image.Image) -> tuple[str, dict]:
+def ai_extract_fields(pil_img: Image.Image) -> tuple[str, dict]:
+    """
+    Gemini Vision عبر REST (بدون مكتبات إضافية).
+    يرجّع:
+      - raw_text: النص الخام (JSON أو رسالة خطأ) للـ debug
+      - fields: dict جاهز للعرض (Model/Serial/Voltage_V/Current_A/Power_kW/Frequency_Hz)
+    """
     empty = {
         "Model": "",
         "Serial": "",
@@ -227,71 +233,157 @@ def gemini_extract_fields(pil_img: Image.Image) -> tuple[str, dict]:
         "Frequency_Hz": "",
     }
 
-    api_key, model = get_gemini_settings()
+    # 1) اقرأ المفتاح والموديل من secrets أو env
+    api_key = ""
+    model = "gemini-2.5-flash"
+    try:
+        api_key = (st.secrets.get("GEMINI_API_KEY", "") or "").strip()
+        model = (st.secrets.get("GEMINI_MODEL", model) or model).strip()
+    except Exception:
+        api_key = (os.environ.get("GEMINI_API_KEY", "") or "").strip()
+        model = (os.environ.get("GEMINI_MODEL", model) or model).strip()
+
     if not api_key:
-        return "Gemini key missing: set GEMINI_API_KEY in Streamlit Secrets.", empty
+        return "Gemini API key missing: set GEMINI_API_KEY in Streamlit Secrets.", empty
+
+    # 2) حضّر الصورة (JPEG) + base64
+    try:
+        img = pil_img.convert("RGB")
+        # تصغير بسيط عشان القراءة تكون أوضح وأسرع (اختياري)
+        max_w = 1400
+        if img.width > max_w:
+            ratio = max_w / float(img.width)
+            img = img.resize((max_w, int(img.height * ratio)))
+
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=85, optimize=True)
+        b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+    except Exception as e:
+        return f"Image encode error: {e}", empty
+
+    # 3) Prompt (شدّدنا على: JSON فقط + بدون أسطر داخل القيم)
+    prompt = (
+        "You are an expert electrical auditor. Extract nameplate fields from the image.\n"
+        "Return ONLY valid JSON (no markdown, no code fences).\n"
+        "Rules:\n"
+        "- All string values must be SINGLE-LINE (no line breaks).\n"
+        "- If missing, use null.\n"
+        "- voltage_v: number (if range like 220-240, return 230).\n"
+        "- power_kw: number in kW (if label shows W, convert to kW).\n\n"
+        "Return exactly this schema:\n"
+        "{\n"
+        '  "model": string|null,\n'
+        '  "serial": string|null,\n'
+        '  "voltage_v": number|null,\n'
+        '  "current_a": number|null,\n'
+        '  "power_kw": number|null,\n'
+        '  "frequency_hz": number|null\n'
+        "}\n"
+    )
+
+    # 4) Gemini REST call مع JSON mode
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    payload = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [
+                    {"text": prompt},
+                    {"inline_data": {"mime_type": "image/jpeg", "data": b64}},
+                ],
+            }
+        ],
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "temperature": 0.0,
+            "maxOutputTokens": 220,
+        },
+    }
 
     try:
-        buf = io.BytesIO()
-        pil_img.convert("RGB").save(buf, format="JPEG", quality=90)
-        b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-
-        prompt = (
-            "You are an electrical audit assistant.\n"
-            "Read the nameplate image and return ONLY a JSON object with keys:\n"
-            "model, serial, voltage_v, current_a, power_kw, frequency_hz\n\n"
-            "Rules:\n"
-            "- Keep model/serial EXACTLY as printed.\n"
-            "- voltage_v must be a number (if '220-240V' use 230).\n"
-            "- power_kw: if W convert to kW (e.g., 2400W -> 2.4).\n"
-            "- If a field is missing, use null.\n"
-            "Return JSON ONLY (no markdown, no explanation)."
-        )
-
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-        payload = {
-            "contents": [
-                {
-                    "role": "user",
-                    "parts": [
-                        {"text": prompt},
-                        {"inline_data": {"mime_type": "image/jpeg", "data": b64}},
-                    ],
-                }
-            ],
-            "generationConfig": {"temperature": 0, "maxOutputTokens": 256},
-        }
-
         r = requests.post(url, json=payload, timeout=60)
         if not r.ok:
-            return f"Gemini HTTP {r.status_code}: {r.text}", empty
-
+            return f"Gemini HTTP {r.status_code}: {r.text[:1200]}", empty
         resp = r.json()
-        text = resp["candidates"][0]["content"]["parts"][0].get("text", "").strip()
-
-        json_text = extract_first_json(text)
-        if not json_text:
-            return f"Gemini returned no JSON. Raw: {text[:400]}", empty
-
-        data = json.loads(json_text)
-
-        fields = {
-            "Model": "" if data.get("model") is None else str(data.get("model")).strip(),
-            "Serial": "" if data.get("serial") is None else str(data.get("serial")).strip(),
-            "Voltage_V": "" if data.get("voltage_v") is None else str(data.get("voltage_v")).strip(),
-            "Current_A": "" if data.get("current_a") is None else str(data.get("current_a")).strip(),
-            "Power_kW": "" if data.get("power_kw") is None else str(data.get("power_kw")).strip(),
-            "Frequency_Hz": "" if data.get("frequency_hz") is None else str(data.get("frequency_hz")).strip(),
-        }
-        return json_text, fields
-
     except Exception as e:
-        return f"Gemini vision error: {e}", empty
+        return f"Gemini request error: {e}", empty
+
+    # 5) اقرأ النص المرجّع
+    raw_text = ""
+    try:
+        raw_text = resp["candidates"][0]["content"]["parts"][0]["text"]
+    except Exception:
+        raw_text = json.dumps(resp, ensure_ascii=False)[:2000]
+
+    # 6) Parser أقوى: حمّلي JSON مباشرة، وإذا فشل قصّي { ... }
+    def _strip_fences(s: str) -> str:
+        s = (s or "").strip()
+        s = re.sub(r"^```(?:json)?\s*", "", s, flags=re.IGNORECASE)
+        s = re.sub(r"\s*```$", "", s)
+        return s.strip()
+
+    cleaned = _strip_fences(raw_text)
+
+    obj = None
+    try:
+        obj = json.loads(cleaned)
+    except Exception:
+        m = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
+        if m:
+            try:
+                obj = json.loads(m.group(0))
+            except Exception:
+                obj = None
+
+    if not isinstance(obj, dict):
+        return f"Gemini returned no JSON. Raw: {raw_text[:1200]}", empty
+
+    # 7) Normalize + safeguards
+    def to_num(x):
+        if x is None:
+            return None
+        if isinstance(x, (int, float)):
+            return float(x)
+        s = str(x).strip()
+        # التقط أول رقم (يدعم 220-240)
+        rng = re.findall(r"[-+]?\d+(\.\d+)?", s)
+        if not rng:
+            return None
+        # إذا كان Range (220-240) خذ الوسط
+        nums = [float(re.findall(r"[-+]?\d+(\.\d+)?", t)[0]) if False else float(re.search(r"[-+]?\d+(\.\d+)?", t).group(0)) for t in re.findall(r"[-+]?\d+(\.\d+)?", s)]
+        # ^ السطر أعلاه حساس؛ الأسهل:
+        nums2 = [float(m.group(0)) for m in re.finditer(r"[-+]?\d+(\.\d+)?", s)]
+        if len(nums2) >= 2 and "-" in s:
+            return (nums2[0] + nums2[1]) / 2.0
+        return nums2[0] if nums2 else None
+
+    model_val = obj.get("model")
+    serial_val = obj.get("serial")
+
+    v = to_num(obj.get("voltage_v"))
+    a = to_num(obj.get("current_a"))
+    p = to_num(obj.get("power_kw"))
+    hz = to_num(obj.get("frequency_hz"))
+
+    # لو power طلع كبير جدًا بالغلط (W)، نحاول نحوله لـ kW
+    if p is not None and p > 50:  # غالبًا W
+        p = p / 1000.0
+
+    fields = {
+        "Model": (str(model_val).replace("\n", " ").strip() if model_val else ""),
+        "Serial": (str(serial_val).replace("\n", " ").strip() if serial_val else ""),
+        "Voltage_V": ("" if v is None else str(round(v, 3)).rstrip("0").rstrip(".")),
+        "Current_A": ("" if a is None else str(round(a, 3)).rstrip("0").rstrip(".")),
+        "Power_kW": ("" if p is None else str(round(p, 3)).rstrip("0").rstrip(".")),
+        "Frequency_Hz": ("" if hz is None else str(round(hz, 3)).rstrip("0").rstrip(".")),
+    }
+
+    return json.dumps(obj, ensure_ascii=False), fields
 
 
 def analyze_nameplate(pil_img: Image.Image) -> tuple[str, dict]:
     classic = classic_ocr_text(pil_img)  # optional
-    ai_json, ai_fields = gemini_extract_fields(pil_img)
+    ai_json, ai_fields = ai_extract_fields(pil_img)
 
     raw_combined = ""
     if classic:
@@ -660,3 +752,4 @@ if os.path.exists(CSV_PATH):
         st.info("No records for this facility yet. Save at least one nameplate record.")
 else:
     st.info("No CSV records yet. Save at least one nameplate record first.")
+
