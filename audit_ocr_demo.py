@@ -26,6 +26,7 @@ except Exception:
     genai = None
     types = None
 
+st.write("BUILD:", "2026-01-04 v1")
 
 # =========================================================
 # 0) CONFIG
@@ -646,6 +647,7 @@ if os.path.exists(CSV_PATH):
         st.info("No records for this facility yet. Save at least one record first.")
 else:
     st.info("No CSV records yet. Save at least one record first.")
+
 
 
 
