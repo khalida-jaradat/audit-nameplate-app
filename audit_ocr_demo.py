@@ -32,8 +32,8 @@ except Exception:
 # =========================================================
 
 AUDIT_TEMPLATES = {
-    "Hotelsسس": [
-        "Lobby",
+    "Hotelsس": [
+        "Lobbyسس",
         "Rooms",
         "Kitchen",
         "Pool",
@@ -646,3 +646,4 @@ if os.path.exists(CSV_PATH):
         st.info("No records for this facility yet. Save at least one record first.")
 else:
     st.info("No CSV records yet. Save at least one record first.")
+
