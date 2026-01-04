@@ -8,6 +8,8 @@ google-generativeai
 numpy
 openai
 pillow-heif
+google-genai>=0.6.0
+
 
 
 
