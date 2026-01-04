@@ -3,22 +3,28 @@ import re
 import io
 import json
 import base64
-import hashlib
 from datetime import datetime
 
 import streamlit as st
 import pandas as pd
 from PIL import Image
 
-import requests
+import cv2
+import numpy as np
+import pytesseract
 
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image as XLImage
 from openpyxl.utils import get_column_letter
 from openpyxl.styles import Font, Alignment, PatternFill
 
+# Gemini (NEW SDK)
+from google import genai
+from google.genai import types
+
+
 # =========================================================
-# 0) CONFIG (آخر أسماء ثابتة حسب تعديلك)
+# 0) CONFIG
 # =========================================================
 
 AUDIT_TEMPLATES = {
@@ -46,8 +52,8 @@ AUDIT_TEMPLATES = {
         "Chilled Water Network",
         "Compressed Air Network",
         "Hot Water Network",
-        "Steam Network",
-        "Steam Generator",
+        "Steam Network ",
+        " Steam Generator",
     ],
     "Schools": [
         "Classrooms",
@@ -83,6 +89,9 @@ THUMBS_DIR = os.path.join(OUTPUT_DIR, "_thumbs")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(THUMBS_DIR, exist_ok=True)
 
+DEFAULT_TESS_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
+
 # =========================================================
 # 1) HELPERS
 # =========================================================
@@ -91,6 +100,15 @@ def safe_name(s: str) -> str:
     s = s or ""
     s = re.sub(r"[^A-Za-z0-9_\- ]+", "", s).strip()
     return s.replace(" ", "_") if s else "AUDIT"
+
+
+def ensure_tesseract():
+    env_cmd = os.environ.get("TESSERACT_CMD", "").strip()
+    if env_cmd and os.path.exists(env_cmd):
+        pytesseract.pytesseract.tesseract_cmd = env_cmd
+        return
+    if os.name == "nt" and os.path.exists(DEFAULT_TESS_CMD):
+        pytesseract.pytesseract.tesseract_cmd = DEFAULT_TESS_CMD
 
 
 def append_record(row: dict):
@@ -102,7 +120,7 @@ def append_record(row: dict):
     df.to_csv(CSV_PATH, index=False)
 
 
-def create_thumbnail(img_path: str) -> str | None:
+def create_thumbnail(img_path: str):
     try:
         if not img_path or not os.path.exists(img_path):
             return None
@@ -118,20 +136,265 @@ def create_thumbnail(img_path: str) -> str | None:
         return None
 
 
+def image_to_jpeg_bytes(pil_img: Image.Image) -> bytes:
+    """Convert any input image (PNG/WEBP/HEIC if PIL supports) into JPEG bytes for Gemini."""
+    img = pil_img.convert("RGB")
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=92)
+    return buf.getvalue()
+
+
+def parse_json_from_text(text: str):
+    """
+    Robust JSON parser:
+    - removes ```json fences
+    - extracts substring between first '{' and last '}'
+    - fixes common trailing comma issues
+    """
+    if not text:
+        return None
+
+    cleaned = text.strip()
+    cleaned = re.sub(r"```(?:json)?", "", cleaned, flags=re.IGNORECASE).replace("```", "").strip()
+
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+
+    snippet = cleaned[start:end + 1].strip()
+
+    # Fix common issues
+    snippet = re.sub(r",\s*}", "}", snippet)
+    snippet = re.sub(r",\s*]", "]", snippet)
+
+    try:
+        return json.loads(snippet)
+    except Exception:
+        return None
+
+
+# =========================================================
+# 2) CLASSIC OCR (OPTIONAL) + REGEX
+# =========================================================
+
+def preprocess_for_ocr(pil_img: Image.Image) -> np.ndarray:
+    img = np.array(pil_img.convert("RGB"))
+    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
+    img = cv2.resize(img, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.bilateralFilter(gray, 9, 75, 75)
+
+    th = cv2.adaptiveThreshold(
+        gray, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        31, 10
+    )
+    return th
+
+
+def classic_ocr_text(pil_img: Image.Image) -> str:
+    try:
+        ensure_tesseract()
+        proc = preprocess_for_ocr(pil_img)
+        text = pytesseract.image_to_string(proc, config="--oem 3 --psm 6", lang="eng")
+        return text or ""
+    except Exception:
+        return ""
+
+
+def extract_fields_from_text(raw_text: str) -> dict:
+    """Regex fallback (مش مثالي بس مفيد لو AI فشل)."""
+    t = " ".join((raw_text or "").split())
+
+    voltage = None
+    m = re.search(r"(\d{2,4})\s*V\b", t, re.IGNORECASE)
+    if m:
+        voltage = m.group(1)
+
+    freq = None
+    m = re.search(r"(\d{2,3})\s*Hz\b", t, re.IGNORECASE)
+    if m:
+        freq = m.group(1)
+
+    power_kw = None
+    m = re.search(r"(\d+(\.\d+)?)\s*kW\b", t, re.IGNORECASE)
+    if m:
+        power_kw = m.group(1)
+    if not power_kw:
+        m = re.search(r"(\d+(\.\d+)?)\s*W\b", t, re.IGNORECASE)
+        if m:
+            try:
+                w = float(m.group(1))
+                power_kw = str(round(w / 1000.0, 3))
+            except Exception:
+                power_kw = m.group(1)
+
+    current_a = None
+    m = re.search(r"(\d+(\.\d+)?)\s*A\b", t, re.IGNORECASE)
+    if m:
+        current_a = m.group(1)
+
+    serial = None
+    m = re.search(r"(S\/N|SN|Serial)\s*[:\-]?\s*([A-Z0-9\-\/]+)", t, re.IGNORECASE)
+    if m:
+        serial = m.group(2)
+
+    model = None
+    m = re.search(r"(Model|Type)\s*[:\-]?\s*([A-Z0-9\-\/\(\)]+)", t, re.IGNORECASE)
+    if m:
+        model = m.group(2)
+
+    return {
+        "Model": model or "",
+        "Serial": serial or "",
+        "Voltage_V": voltage or "",
+        "Current_A": current_a or "",
+        "Power_kW": power_kw or "",
+        "Frequency_Hz": freq or "",
+    }
+
+
+# =========================================================
+# 3) GEMINI VISION (MAIN)
+# =========================================================
+
+def get_gemini_key():
+    # secrets first
+    try:
+        key = st.secrets.get("GEMINI_API_KEY", "")
+        if key:
+            return key
+    except Exception:
+        pass
+    # env fallback
+    return os.environ.get("GEMINI_API_KEY", "")
+
+
+def gemini_extract_fields(pil_img: Image.Image):
+    """
+    Returns: (raw_text, fields_dict, error_message_or_None)
+    """
+    api_key = get_gemini_key()
+    if not api_key:
+        return "", empty_fields(), "Missing GEMINI_API_KEY in Streamlit secrets."
+
+    try:
+        client = genai.Client(api_key=api_key)
+
+        img_bytes = image_to_jpeg_bytes(pil_img)
+
+        prompt = (
+            "You are an electrical audit expert. Extract ONLY these fields from the nameplate image and return VALID JSON only.\n"
+            "Fields:\n"
+            "model (string|null)\n"
+            "serial (string|null)\n"
+            "voltage_v (number|null)  # if range 220-240, return 230\n"
+            "current_a (number|null)\n"
+            "power_kw (number|null)   # if W, convert to kW\n"
+            "frequency_hz (number|null)\n"
+            "Return JSON ONLY. No markdown. No backticks."
+        )
+
+        # JSON schema to FORCE clean JSON output :contentReference[oaicite:1]{index=1}
+        schema = {
+            "type": "object",
+            "properties": {
+                "model": {"type": ["string", "null"]},
+                "serial": {"type": ["string", "null"]},
+                "voltage_v": {"type": ["number", "null"]},
+                "current_a": {"type": ["number", "null"]},
+                "power_kw": {"type": ["number", "null"]},
+                "frequency_hz": {"type": ["number", "null"]},
+            },
+            "required": ["model", "serial", "voltage_v", "current_a", "power_kw", "frequency_hz"],
+        }
+
+        resp = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[
+                prompt,
+                types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"),
+            ],
+            config=types.GenerateContentConfig(
+                temperature=0,
+                max_output_tokens=256,
+                response_mime_type="application/json",
+                response_schema=schema,
+            ),
+        )
+
+        raw = (resp.text or "").strip()
+        data = parse_json_from_text(raw)
+        if data is None:
+            return raw, empty_fields(), f"Gemini returned no JSON. Raw: {raw[:200]}..."
+
+        fields = {
+            "Model": (data.get("model") or "") if isinstance(data, dict) else "",
+            "Serial": (data.get("serial") or "") if isinstance(data, dict) else "",
+            "Voltage_V": str(data.get("voltage_v") or "") if isinstance(data, dict) else "",
+            "Current_A": str(data.get("current_a") or "") if isinstance(data, dict) else "",
+            "Power_kW": str(data.get("power_kw") or "") if isinstance(data, dict) else "",
+            "Frequency_Hz": str(data.get("frequency_hz") or "") if isinstance(data, dict) else "",
+        }
+        return raw, fields, None
+
+    except Exception as e:
+        return "", empty_fields(), f"Gemini vision error: {e}"
+
+
+def empty_fields():
+    return {
+        "Model": "",
+        "Serial": "",
+        "Voltage_V": "",
+        "Current_A": "",
+        "Power_kW": "",
+        "Frequency_Hz": "",
+    }
+
+
+def analyze_nameplate(pil_img: Image.Image):
+    """
+    1) Gemini (main)
+    2) Classic OCR + regex (fallback)
+    """
+    raw_ai, fields_ai, err = gemini_extract_fields(pil_img)
+
+    # fallback if AI empty
+    raw_classic = classic_ocr_text(pil_img)
+    fields_ocr = extract_fields_from_text(raw_classic) if raw_classic else empty_fields()
+
+    # merge
+    fields = {
+        "Model": fields_ai.get("Model") or fields_ocr.get("Model", ""),
+        "Serial": fields_ai.get("Serial") or fields_ocr.get("Serial", ""),
+        "Voltage_V": fields_ai.get("Voltage_V") or fields_ocr.get("Voltage_V", ""),
+        "Current_A": fields_ai.get("Current_A") or fields_ocr.get("Current_A", ""),
+        "Power_kW": fields_ai.get("Power_kW") or fields_ocr.get("Power_kW", ""),
+        "Frequency_Hz": fields_ai.get("Frequency_Hz") or fields_ocr.get("Frequency_Hz", ""),
+    }
+
+    raw_combined = ""
+    if raw_ai:
+        raw_combined += raw_ai
+    if raw_classic:
+        raw_combined += ("\n\n---\n\n" + raw_classic)
+
+    return raw_combined, fields, err
+
+
+# =========================================================
+# 4) EXCEL EXPORT
+# =========================================================
+
 def build_excel_report(df: pd.DataFrame, out_path: str):
     cols = [
-        "Record ID",
-        "Place Name",
-        "PlaceIndex",
-        "Model",
-        "Serial",
-        "Voltage (V)",
-        "Current (A)",
-        "Power (kW)",
-        "Frequency (Hz)",
-        "Capture DateTime",
-        "Notes",
-        "Nameplate Image",
+        "Record ID", "Place Name", "PlaceIndex",
+        "Model", "Serial", "Voltage (V)", "Current (A)", "Power (kW)", "Frequency (Hz)",
+        "Capture DateTime", "Notes", "Nameplate Image"
     ]
 
     header_fill = PatternFill("solid", fgColor="1F2937")
@@ -139,11 +402,7 @@ def build_excel_report(df: pd.DataFrame, out_path: str):
     center = Alignment(vertical="center", wrap_text=True)
 
     def set_col_widths(ws):
-        widths = {
-            1: 10,  2: 22,  3: 10,  4: 22,  5: 22,
-            6: 12,  7: 12,  8: 12,  9: 14,  10: 22,
-            11: 22, 12: 30,
-        }
+        widths = {1: 10, 2: 18, 3: 10, 4: 20, 5: 22, 6: 12, 7: 12, 8: 12, 9: 14, 10: 22, 11: 22, 12: 30}
         for col_idx, w in widths.items():
             ws.column_dimensions[get_column_letter(col_idx)].width = w
 
@@ -178,35 +437,30 @@ def build_excel_report(df: pd.DataFrame, out_path: str):
             record_id = f"{rec_counter:03d}"
             rec_counter += 1
 
-            ws.append(
-                [
-                    record_id,
-                    row.get("Place", ""),
-                    row.get("PlaceIndex", ""),
-                    row.get("Model", ""),
-                    row.get("Serial", ""),
-                    row.get("Voltage_V", ""),
-                    row.get("Current_A", ""),
-                    row.get("Power_kW", ""),
-                    row.get("Frequency_Hz", ""),
-                    row.get("Timestamp", ""),
-                    row.get("Notes", ""),
-                    "",
-                ]
-            )
+            ws.append([
+                record_id,
+                place,
+                row.get("PlaceIndex", ""),
+                row.get("Model", ""),
+                row.get("Serial", ""),
+                row.get("Voltage_V", ""),
+                row.get("Current_A", ""),
+                row.get("Power_kW", ""),
+                row.get("Frequency_Hz", ""),
+                row.get("Timestamp", ""),
+                row.get("Notes", ""),
+                "",
+            ])
 
             r = ws.max_row
             ws.row_dimensions[r].height = 120
 
-            img_path = str(row.get("ImagePath", "")).strip()
-            img_path = os.path.normpath(img_path)
+            img_path = os.path.normpath(str(row.get("ImagePath", "")).strip())
             thumb_path = create_thumbnail(img_path)
-
             if thumb_path and os.path.exists(thumb_path):
                 try:
                     xl_img = XLImage(thumb_path)
-                    anchor_cell = f"{get_column_letter(len(cols))}{r}"
-                    xl_img.anchor = anchor_cell
+                    xl_img.anchor = f"{get_column_letter(len(cols))}{r}"
                     ws.add_image(xl_img)
                 except Exception:
                     pass
@@ -216,186 +470,14 @@ def build_excel_report(df: pd.DataFrame, out_path: str):
 
     wb.save(out_path)
 
-# =========================================================
-# 2) GEMINI VISION (Google AI Studio Key)
-# =========================================================
-
-def get_gemini_settings():
-    api_key = None
-    model = "gemini-2.5-flash"
-
-    # Streamlit secrets أولاً
-    try:
-        api_key = st.secrets.get("GEMINI_API_KEY", None)
-        model = st.secrets.get("GEMINI_MODEL", model)
-    except Exception:
-        pass
-
-    # Env fallback
-    api_key = api_key or os.environ.get("GEMINI_API_KEY")
-    model = model or os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-
-    return api_key, model
-
-
-def _strip_to_json(text: str) -> dict | None:
-    if not text:
-        return None
-
-    t = text.strip()
-
-    # شيل code fences
-    t = re.sub(r"^```(?:json)?", "", t.strip(), flags=re.IGNORECASE).strip()
-    t = re.sub(r"```$", "", t.strip()).strip()
-
-    # حاول parse مباشر
-    try:
-        return json.loads(t)
-    except Exception:
-        pass
-
-    # حاول قص من أول { لآخر }
-    start = t.find("{")
-    end = t.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        chunk = t[start:end+1]
-        try:
-            return json.loads(chunk)
-        except Exception:
-            return None
-
-    return None
-
-
-def gemini_extract_fields(image_bytes: bytes, mime_type: str = "image/jpeg") -> tuple[str, dict]:
-    api_key, model = get_gemini_settings()
-
-    if not api_key:
-        return "GEMINI_API_KEY is missing in Streamlit Secrets.", {
-            "Model": "", "Serial": "", "Voltage_V": "", "Current_A": "", "Power_kW": "", "Frequency_Hz": ""
-        }
-
-    endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-    headers = {
-        "Content-Type": "application/json",
-        "x-goog-api-key": api_key,
-    }
-
-    b64 = base64.b64encode(image_bytes).decode("utf-8")
-
-    prompt = (
-        "You are extracting electrical nameplate fields from ONE image.\n"
-        "Return ONLY a valid JSON object with EXACT keys:\n"
-        "model, serial, voltage_v, current_a, power_kw, frequency_hz\n\n"
-        "Rules:\n"
-        "- If a value is missing, return empty string.\n"
-        "- voltage_v/current_a/power_kw/frequency_hz must be numbers as text (e.g. \"230\", \"2.0\", \"0.4\", \"50\").\n"
-        "- If voltage is a range like 220-240V, return \"230\".\n"
-        "- If power is in W, convert to kW (e.g. 400W -> \"0.4\").\n"
-        "Return JSON only. No markdown, no explanations."
-    )
-
-    payload = {
-        "contents": [
-            {
-                "role": "user",
-                "parts": [
-                    {"text": prompt},
-                    {"inlineData": {"mimeType": mime_type, "data": b64}},
-                ],
-            }
-        ],
-        "generationConfig": {
-            "temperature": 0,
-            "maxOutputTokens": 220,
-        },
-    }
-
-    # محاولة أولى
-    try:
-        r = requests.post(endpoint, headers=headers, json=payload, timeout=60)
-        if r.status_code != 200:
-            return f"Gemini HTTP {r.status_code}: {r.text}", {
-                "Model": "", "Serial": "", "Voltage_V": "", "Current_A": "", "Power_kW": "", "Frequency_Hz": ""
-            }
-
-        data = r.json()
-        raw_text = ""
-        try:
-            raw_text = data["candidates"][0]["content"]["parts"][0].get("text", "")
-        except Exception:
-            raw_text = str(data)
-
-        obj = _strip_to_json(raw_text)
-
-        # لو ما نجح، نعمل retry prompt أقسى
-        if obj is None:
-            payload["contents"][0]["parts"][0]["text"] = (
-                "Return STRICT JSON ONLY. No code fences. No extra text.\n"
-                "Keys: model, serial, voltage_v, current_a, power_kw, frequency_hz\n"
-                "All values must be strings. Missing -> \"\".\n"
-            )
-            r2 = requests.post(endpoint, headers=headers, json=payload, timeout=60)
-            if r2.status_code != 200:
-                return f"Gemini HTTP {r2.status_code}: {r2.text}", {
-                    "Model": "", "Serial": "", "Voltage_V": "", "Current_A": "", "Power_kW": "", "Frequency_Hz": ""
-                }
-            data2 = r2.json()
-            raw_text2 = ""
-            try:
-                raw_text2 = data2["candidates"][0]["content"]["parts"][0].get("text", "")
-            except Exception:
-                raw_text2 = str(data2)
-
-            obj = _strip_to_json(raw_text2)
-            if obj is None:
-                return f"Gemini returned no JSON. Raw: {raw_text2[:800]}", {
-                    "Model": "", "Serial": "", "Voltage_V": "", "Current_A": "", "Power_kW": "", "Frequency_Hz": ""
-                }
-            raw_text = raw_text2  # للـ debug
-
-        fields = {
-            "Model": str(obj.get("model", "") or ""),
-            "Serial": str(obj.get("serial", "") or ""),
-            "Voltage_V": str(obj.get("voltage_v", "") or ""),
-            "Current_A": str(obj.get("current_a", "") or ""),
-            "Power_kW": str(obj.get("power_kw", "") or ""),
-            "Frequency_Hz": str(obj.get("frequency_hz", "") or ""),
-        }
-        return raw_text, fields
-
-    except Exception as e:
-        return f"Gemini vision error: {e}", {
-            "Model": "", "Serial": "", "Voltage_V": "", "Current_A": "", "Power_kW": "", "Frequency_Hz": ""
-        }
-
-
-def detect_mime(uploaded_file) -> str:
-    # Streamlit uploader sometimes provides type
-    try:
-        if getattr(uploaded_file, "type", None):
-            return uploaded_file.type
-    except Exception:
-        pass
-    return "image/jpeg"
-
 
 # =========================================================
-# 3) STREAMLIT UI
+# 5) STREAMLIT UI
 # =========================================================
 
-st.set_page_config(page_title="Audit Nameplate - Gemini", layout="wide")
-st.title("Audit Nameplate Capture (Gemini Vision)")
+st.set_page_config(page_title="Audit Nameplate App", layout="wide")
+st.title("Audit Nameplate App (Gemini 2.5 Flash)")
 
-api_key, model_name = get_gemini_settings()
-
-with st.sidebar:
-    st.subheader("System Status")
-    st.write(f"Model: `{model_name}`")
-    st.write(f"AI Vision: {'ENABLED ✅' if api_key else 'DISABLED ❌'}")
-    st.write(f"Key length: {len(api_key) if api_key else 0}")
-
-# اختيار نوع الأوديت والمنشأة
 col1, col2 = st.columns(2)
 with col1:
     audit_type = st.selectbox("Audit Type", list(AUDIT_TEMPLATES.keys()))
@@ -406,58 +488,35 @@ default_places = AUDIT_TEMPLATES.get(audit_type, [])
 
 st.divider()
 st.subheader("Audit Components (editable list)")
-places_text = st.text_area(
-    "One place per line",
-    value="\n".join(default_places),
-    height=180,
-)
+places_text = st.text_area("One place per line", value="\n".join(default_places), height=180)
 places = [p.strip() for p in places_text.splitlines() if p.strip()]
 
 if not places:
-    st.warning("Please add at least one place (one per line).")
+    st.warning("Please add at least one place to continue.")
 
 st.divider()
-st.subheader("Choose a place")
+st.subheader("Choose a place to capture nameplates")
 
 place = st.selectbox("Place", places) if places else None
+count = st.number_input("How many instances of this place?", min_value=1, max_value=20, value=1)
 
-# (رجّعنا القديم) عدد التكرارات موجود
-count = st.number_input(
-    "How many instances of this place?",
-    min_value=1,
-    max_value=20,
-    value=1,
-)
-
-# Custom area name (اختياري) — وبنخليه ينضاف جنب Place عند الحفظ/الإكسل
-custom_area = st.text_input(
-    "Custom area name (optional) – e.g., Main Kitchen, West Lobby",
-    value="",
-)
-
-place_label = place
-if place and custom_area.strip():
-    place_label = f"{place} - {custom_area.strip()}"
-
-if facility_name and place_label:
-    st.info(f"You will capture nameplates for: **{facility_name} → {place_label} (1..{int(count)})**")
+if facility_name and place:
+    st.info(f"You will capture nameplates for: **{facility_name} → {place} (1..{int(count)})**")
 
 st.divider()
 st.subheader("Capture nameplates")
 
 if facility_name and place:
     for i in range(1, int(count) + 1):
-        with st.expander(f"{place_label} #{i}", expanded=(i == 1)):
+        with st.expander(f"{place} #{i}", expanded=(i == 1)):
 
-            # خيار الكاميرا (يفيد للموبايل)
             camera_photo = st.camera_input(
-                f"Take photo for {place_label} #{i}",
+                f"Take photo for {place} #{i}",
                 key=f"cam_{audit_type}_{place}_{i}",
             )
 
-            # أو رفع صورة
             uploaded = st.file_uploader(
-                f"Or upload existing image for {place_label} #{i}",
+                f"Or upload existing image for {place} #{i}",
                 type=["png", "jpg", "jpeg", "webp"],
                 key=f"upl_{audit_type}_{place}_{i}",
             )
@@ -465,60 +524,38 @@ if facility_name and place:
             image_file = camera_photo or uploaded
 
             if image_file:
-                img_bytes = image_file.getvalue()
-                mime = detect_mime(image_file)
+                pil_img = Image.open(image_file)
+                st.image(pil_img, caption="Captured image", use_container_width=True)
 
-                # افتحها بـ PIL (لو فشل لأي سبب نعرض رسالة)
-                try:
-                    pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-                except Exception as e:
-                    st.error(f"Could not open image on server. Try JPG/PNG. Error: {e}")
-                    st.stop()
+                with st.spinner("Analyzing image (Gemini + optional OCR fallback)..."):
+                    raw, fields, ai_err = analyze_nameplate(pil_img)
 
-                st.image(pil_img, caption="Uploaded image", use_container_width=True)
-
-                # مهم جدًا: لا نستدعي الـ AI كل rerun
-                img_hash = hashlib.sha256(img_bytes).hexdigest()[:12]
-                state_key = f"analysis_{audit_type}_{place_label}_{i}_{img_hash}"
-
-                if state_key not in st.session_state:
-                    if st.button("Analyze image (AI)", key=f"an_{audit_type}_{place_label}_{i}_{img_hash}"):
-                        with st.spinner("Analyzing image with Gemini..."):
-                            raw, fields = gemini_extract_fields(img_bytes, mime_type=mime)
-                        st.session_state[state_key] = {"raw": raw, "fields": fields}
-                else:
-                    raw = st.session_state[state_key]["raw"]
-                    fields = st.session_state[state_key]["fields"]
-
-                # لو لسه ما حللنا، ما نعرض حقول فاضية بس
-                if state_key not in st.session_state:
-                    st.info("Click **Analyze image (AI)** to extract fields.")
-                    continue
+                if ai_err:
+                    st.error(ai_err)
 
                 st.markdown("### Extracted fields (edit if needed)")
                 c1, c2, c3, c4, c5, c6 = st.columns(6)
-
                 with c1:
-                    model_val = st.text_input("Model", value=fields.get("Model", ""), key=f"model_{place_label}_{i}")
+                    model = st.text_input("Model", value=fields.get("Model") or "", key=f"model_{place}_{i}")
                 with c2:
-                    serial_val = st.text_input("Serial", value=fields.get("Serial", ""), key=f"serial_{place_label}_{i}")
+                    serial = st.text_input("Serial", value=fields.get("Serial") or "", key=f"serial_{place}_{i}")
                 with c3:
-                    voltage_val = st.text_input("Voltage (V)", value=fields.get("Voltage_V", ""), key=f"volt_{place_label}_{i}")
+                    voltage = st.text_input("Voltage (V)", value=fields.get("Voltage_V") or "", key=f"volt_{place}_{i}")
                 with c4:
-                    current_val = st.text_input("Current (A)", value=fields.get("Current_A", ""), key=f"curr_{place_label}_{i}")
+                    current = st.text_input("Current (A)", value=fields.get("Current_A") or "", key=f"curr_{place}_{i}")
                 with c5:
-                    power_val = st.text_input("Power (kW)", value=fields.get("Power_kW", ""), key=f"pwr_{place_label}_{i}")
+                    power = st.text_input("Power (kW)", value=fields.get("Power_kW") or "", key=f"pwr_{place}_{i}")
                 with c6:
-                    freq_val = st.text_input("Frequency (Hz)", value=fields.get("Frequency_Hz", ""), key=f"hz_{place_label}_{i}")
+                    freq = st.text_input("Frequency (Hz)", value=fields.get("Frequency_Hz") or "", key=f"hz_{place}_{i}")
 
-                notes_val = st.text_input("Notes (optional)", value="", key=f"notes_{place_label}_{i}")
+                notes = st.text_input("Notes (optional)", value="", key=f"notes_{place}_{i}")
 
-                with st.expander("Raw OCR / AI output (debug)"):
-                    st.code(raw[:3000] if raw else "")
+                with st.expander("Raw (AI JSON / OCR text)"):
+                    st.code(raw[:4000] if raw else "")
 
-                if st.button(f"Save record for {place_label} #{i}", key=f"save_{place_label}_{i}"):
+                if st.button(f"Save record for {place} #{i}", key=f"save_{place}_{i}"):
                     safe_fac = safe_name(facility_name)
-                    safe_place = safe_name(place_label)
+                    safe_place = safe_name(place)
 
                     dir_path = os.path.join(OUTPUT_DIR, safe_fac, f"{safe_place}_{i}")
                     os.makedirs(dir_path, exist_ok=True)
@@ -532,67 +569,45 @@ if facility_name and place:
                         "Timestamp": datetime.now().isoformat(timespec="seconds"),
                         "AuditType": audit_type,
                         "Facility": facility_name,
-                        "Place": place_label,  # <-- هون صارت جنبها custom area
+                        "Place": place,
                         "PlaceIndex": i,
-                        "Model": model_val,
-                        "Serial": serial_val,
-                        "Voltage_V": voltage_val,
-                        "Current_A": current_val,
-                        "Power_kW": power_val,
-                        "Frequency_Hz": freq_val,
-                        "Notes": notes_val,
+                        "Model": model,
+                        "Serial": serial,
+                        "Voltage_V": voltage,
+                        "Current_A": current,
+                        "Power_kW": power,
+                        "Frequency_Hz": freq,
+                        "Notes": notes,
                         "ImagePath": img_path,
                         "RawOCR": raw,
                     }
                     append_record(row)
-
-                    json_path = os.path.join(dir_path, f"record_{ts}.json")
-                    with open(json_path, "w", encoding="utf-8") as f:
-                        json.dump(row, f, ensure_ascii=False, indent=2)
-
-                    st.success("Saved! Record added to CSV with local image.")
-
-# =========================================================
-# 4) CURRENT CSV PREVIEW (فلترة حسب Facility الحالية)
-# =========================================================
+                    st.success("Saved! Record added.")
 
 st.divider()
-st.subheader("Current CSV preview")
+st.subheader("Current table (this Facility only)")
 
 if os.path.exists(CSV_PATH):
     df_all = pd.read_csv(CSV_PATH)
-
     if facility_name:
         df_show = df_all[df_all["Facility"] == facility_name].copy()
     else:
-        df_show = df_all.copy()
+        df_show = df_all.tail(50).copy()
 
     st.dataframe(df_show.tail(50), use_container_width=True)
-    st.caption(f"Saved at: {CSV_PATH}")
 else:
-    st.write("No records yet.")
-
-# =========================================================
-# 5) EXPORT EXCEL
-# =========================================================
+    st.info("No records yet.")
 
 st.divider()
 st.subheader("Export Excel (embedded images by Place)")
 
 if os.path.exists(CSV_PATH):
     df_all = pd.read_csv(CSV_PATH)
-
-    if facility_name:
-        df_use = df_all[df_all["Facility"] == facility_name].copy()
-    else:
-        df_use = df_all.copy()
+    df_use = df_all[df_all["Facility"] == facility_name].copy() if facility_name else df_all.copy()
 
     if not df_use.empty:
         safe_fac = safe_name(facility_name or "AUDIT")
-        xlsx_path = os.path.join(
-            OUTPUT_DIR,
-            f"AUDIT_{safe_fac}_{datetime.now().strftime('%Y%m%d')}.xlsx",
-        )
+        xlsx_path = os.path.join(OUTPUT_DIR, f"AUDIT_{safe_fac}_{datetime.now().strftime('%Y%m%d')}.xlsx")
 
         if st.button("Generate Excel with embedded images"):
             for col in ["Notes", "RawOCR", "Current_A"]:
@@ -600,7 +615,7 @@ if os.path.exists(CSV_PATH):
                     df_use[col] = ""
 
             build_excel_report(df_use, xlsx_path)
-            st.success("Excel generated successfully!")
+            st.success("Excel generated!")
 
             with open(xlsx_path, "rb") as f:
                 st.download_button(
@@ -610,6 +625,6 @@ if os.path.exists(CSV_PATH):
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
     else:
-        st.info("No records for this facility yet. Save at least one nameplate record.")
+        st.info("No records for this facility yet.")
 else:
-    st.info("No CSV records yet. Save at least one nameplate record first.")
+    st.info("No CSV records yet.")
